@@ -99,17 +99,34 @@ static void window_pipe(id<MTLDevice> dev) {
   }
 }
 
-static void window_pump(void) {
-  @autoreleasepool {
-    for (;;) {
-      NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
-        untilDate:NSDate.distantPast inMode:NSDefaultRunLoopMode dequeue:YES];
-      if (ev == nil) {
-        break;
+// Waits for done inside the run loop, dispatching the events as they
+// come: the window server's work on this thread (a title-bar drag) runs
+// while the frame waits, not a frame later.
+static void window_wait(bool* done) {
+  for (;;) {
+    @autoreleasepool {
+      for (;;) {
+        NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+          untilDate:NSDate.distantPast inMode:NSDefaultRunLoopMode dequeue:YES];
+        if (ev == nil) {
+          break;
+        }
+        [NSApp sendEvent:ev];
       }
-      [NSApp sendEvent:ev];
+      if (*done) {
+        return;
+      }
+      [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode
+        beforeDate:NSDate.distantFuture];
     }
   }
+}
+
+static void window_wake(bool* done) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    *done = true;
+    CFRunLoopStop(CFRunLoopGetMain());
+  });
 }
 
 static id<MTLBuffer> window_corpus(Env e, id<MTLDevice> dev) {
@@ -145,29 +162,33 @@ static void window_show(Env e, CAMetalLayer* layer, Term image) {
   while ((1u << args.k) < args.w || (1u << args.k) < args.h) {
     args.k += 1;
   }
-  window_pump();
-  @autoreleasepool {
-    id<CAMetalDrawable> d = [layer nextDrawable];
-    if (d == nil) {
-      return;
+  __block bool done = false;
+  id<MTLCommandBuffer> cb = [window_que commandBuffer];
+  // nextDrawable blocks until the display frees one: on a helper thread
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+    @autoreleasepool {
+      id<CAMetalDrawable> d = [layer nextDrawable];
+      if (d != nil) {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        NSUInteger tw = window_pso.threadExecutionWidth;
+        [enc setComputePipelineState:window_pso];
+        [enc setBuffer:buf offset:0 atIndex:0];
+        [enc setBytes:&args length:sizeof(args) atIndex:1];
+        [enc setTexture:d.texture atIndex:0];
+        [enc dispatchThreads:MTLSizeMake(args.w, args.h, 1)
+          threadsPerThreadgroup:MTLSizeMake(tw,
+            window_pso.maxTotalThreadsPerThreadgroup / tw, 1)];
+        [enc endEncoding];
+        [cb presentDrawable:d];
+        [cb commit];
+        [cb waitUntilCompleted];
+      }
+      window_wake(&done);
     }
-    id<MTLCommandBuffer> cb = [window_que commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    NSUInteger tw = window_pso.threadExecutionWidth;
-    [enc setComputePipelineState:window_pso];
-    [enc setBuffer:buf offset:0 atIndex:0];
-    [enc setBytes:&args length:sizeof(args) atIndex:1];
-    [enc setTexture:d.texture atIndex:0];
-    [enc dispatchThreads:MTLSizeMake(args.w, args.h, 1)
-      threadsPerThreadgroup:MTLSizeMake(tw,
-        window_pso.maxTotalThreadsPerThreadgroup / tw, 1)];
-    [enc endEncoding];
-    [cb presentDrawable:d];
-    [cb commit];
-    [cb waitUntilCompleted];
-    if (cb.error != nil) {
-      err_fail(cb.error.localizedDescription.UTF8String);
-    }
+  });
+  window_wait(&done);
+  if (cb.error != nil) {
+    err_fail(cb.error.localizedDescription.UTF8String);
   }
 }
 
