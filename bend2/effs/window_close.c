@@ -37,6 +37,19 @@ static void window_close(intptr_t at) {
   free(win);
 }
 
+#elif defined(__EMSCRIPTEN__)
+#ifndef BendWin
+#define BendWin BendWin
+typedef struct { u32 w; u32 h; u32* pix; u32 cap; u32* evs; u32 got; } BendWin;
+#endif
+
+static void window_close(intptr_t at) {
+  BendWin* win = (BendWin*)at;
+  free(win->pix);
+  free(win->evs);
+  free(win);
+}
+
 #else
 
 static void window_close(intptr_t at) {

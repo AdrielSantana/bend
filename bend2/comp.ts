@@ -2955,9 +2955,9 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     `(V)[${j}] = ${r};`).join(" ")}`, "",
   `#define WL_TAKE(V) ${rs.slice(0, resw).map((r, j) =>
     `${r} = (V)[${j}];`).join(" ")}`, "",
-  `#define WL_SIG Env e, Stk sp, u32 seq, u32 rn, ${ws.map((w) =>
-    "Term " + w).join(", ")}`, "", `#define WL_ALL e, sp, seq, rn, ${ws
-    .join(", ")}`, "",
+  `#define WL_SIG Corpus e_mem, DEV u64* e_alc, Stk sp, u32 seq, u32 rn, ${ws
+    .map((w) => "Term " + w).join(", ")}`, "",
+  `#define WL_ALL e.mem, e.alc, sp, seq, rn, ${ws.join(", ")}`, "",
   `#define WL_TABLE ${entries.map((s) => `WL_X(${s.fid})`).join(" ")}`
     + " WL_X(FID_EXIT)");
   return defs;
@@ -3445,7 +3445,8 @@ using namespace metal;
 #define UNLOCK(l)  __atomic_store_n(&(l), 0, __ATOMIC_RELEASE)
 #define WL_FN      static PRESERVE(preserve_none) __attribute__((noinline)) Reply
 #define WL_CASE(F) WL_FN WL_##F(WL_SIG)
-#define WL_OPEN    { WL_BANK u32 rn;
+// wasm cannot tail-call with a struct
+#define WL_OPEN    { Env e = { e_mem, e_alc }; WL_BANK u32 rn;
 #define WL_JMP(F)  __attribute__((musttail)) return WL_##F(WL_ALL)
 #define WL_DYN(F)  __attribute__((musttail)) return wl_tab[F](WL_ALL)
 #endif
@@ -4764,7 +4765,7 @@ extern "C" __global__ void bend_dev(Corpus H, u32 pass) {
 // pixels itself. An Image is a quadtree over 2^k x 2^k: a Qua at level
 // i splits its square in four (tl, tr, bl, br), a Qua under the pixels
 // follows tl, a Pix is 0xRRGGBB.
-#if defined(__linux__) || defined(BEND_RTC)
+#ifndef __METAL_VERSION__
 
 INLINE u32 window_pix(Corpus H, Term t, u32 k, u32 x, u32 y) {
   for (u32 i = k; term_tag(t) == TAG_CTR;) {
@@ -4826,7 +4827,12 @@ static void row_grow(Env e, Stk stk, u32 base, u32 stride, u32 want) {
 // Pool
 // ====
 
+#define W32 (sizeof(void*) == 4)
+
 static void* pool_try(void* at, u64 bytes) {
+#ifdef __EMSCRIPTEN__
+  return memalign(16384, bytes) ?: MAP_FAILED; // mmap would memset zeroes
+#endif
   return mmap(at, bytes, PROT_READ | PROT_WRITE,
     MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
 }
@@ -4840,7 +4846,7 @@ static void* pool_mmap(u64 bytes) {
 }
 
 static Term* pool_stack(void) {
-  u64   len = 1ull << 31;
+  u64   len = 1ull << (W32 ? 24 : 31);
   char* p   = pool_mmap(len + 16384 + SIGSTKSZ);
   if (mprotect(p + len, 16384, PROT_NONE) != 0) {
     err_fail("stack guard failed");
@@ -5282,12 +5288,12 @@ static void cube_run(Corpus H, bool gpu) {
 // The cores map 8 GiB at a high base and double it in place, a hint then
 // a check (MAP_FIXED would replace a neighbour), so one base holds every
 // Loc and a run pays for the room it reaches. The banks lie past the pages
-// and move up at each step. The GPU maps its whole span once.
+// and move up at each step. The GPU maps its whole span once, as does wasm32.
 
 static u64 corpus_size;
 
 static void* corpus_map(u64 size) {
-  u64   hint = 1ull << 45;
+  u64   hint = W32 ? 0 : 1ull << 45;
   void* p    = pool_try((void*)hint, size);
   while (p != (void*)hint && hint > size) {
     if (p != MAP_FAILED) {
@@ -5326,7 +5332,7 @@ static bool corpus_grow(Corpus H, u64 need) {
   while (ok && need > a32_load(a32_at(H, H_CAP))) {
     u64   more = corpus_size;
     char* at   = (char*)H + more;
-    void* got  = io_gpu || more >= 1ull << 43 ? MAP_FAILED
+    void* got  = io_gpu || more >= 1ull << 43 || W32 ? MAP_FAILED
       : pool_try(at, more);
     ok = got == at;
     if (ok) {
@@ -5342,7 +5348,7 @@ static bool corpus_grow(Corpus H, u64 need) {
 static Corpus corpus_setup(bool gpu, long threads, u64 bytes) {
   io_gpu     = gpu;
   KEEP_WORDS = gpu ? CHUNK : CAP_WORDS;
-  u64 dflt   = gpu ? gpu_span() : 1ull << 33;
+  u64 dflt   = gpu ? gpu_span() : 1ull << (W32 ? 30 : 33);
   u64 size   = (gpu && bytes != 0 ? bytes : dflt) & ~16383ull;
   CORPUS     = gpu ? gpu_map(size) : corpus_map(size);
   Corpus H   = CORPUS;
@@ -5760,7 +5766,8 @@ static void io_wait(Env e) {
       top = (int)a->work.word;
     }
   }
-  u64 len = (u64)top / 64 * 8 + 8;
+  // a whole fd_set at least: Emscripten's select zeroes one
+  u64 len = (u64)(top > 1023 ? top : 1023) / 64 * 8 + 8;
   u8* set[2] = { io_mem(calloc(2, len)), NULL };
   set[1] = set[0] + len;
   io_bit(set[0], io_wake_fd[0], true);

@@ -3,7 +3,7 @@
 
 // An event is five words: kind (0 key, 1 mouse, 2 move, 3 close) and
 // its fields; a frame answers the events pumped since the last one.
-#if defined(__OBJC__) || defined(__linux__)
+#if defined(__OBJC__) || defined(__linux__) || defined(__EMSCRIPTEN__)
 
 static Term window_node(Env e, const u32* ev) {
   static const u32 cids[3] = { CID_KEY, CID_MOUSE, CID_MOVE };
@@ -140,11 +140,9 @@ static void window_show(Env e, CAMetalLayer* layer, Term image) {
   id<MTLDevice> dev = layer.device;
   window_pipe(dev);
   id<MTLBuffer> buf = window_corpus(e, dev);
-  WinArgs args = { image, layer.drawableSize.width, layer.drawableSize.height,
-    0 };
-  while ((1u << args.k) < args.w || (1u << args.k) < args.h) {
-    args.k += 1;
-  }
+  u32 w = layer.drawableSize.width;
+  u32 h = layer.drawableSize.height;
+  WinArgs args = { image, w, h, window_k(w, h) };
   window_pump();
   @autoreleasepool {
     id<CAMetalDrawable> d = [layer nextDrawable];
@@ -308,11 +306,7 @@ static void window_fill(Env e, u32* pix, u32 w, u32 h, Term image, u32 k) {
     return;
   }
 #endif
-  for (u32 y = 0; y < h; y += 1) {
-    for (u32 x = 0; x < w; x += 1) {
-      pix[y * w + x] = window_pix(e.mem, image, k, x, y);
-    }
-  }
+  window_host(e.mem, image, w, h, k, pix);
 }
 
 // A frame waits for the next 60 Hz tick, as the Mac's display sync.
@@ -329,11 +323,7 @@ static void window_pace(void) {
 static void window_show(Env e, BendWin* win, Term image) {
   u32 w = win->img->width;
   u32 h = win->img->height;
-  u32 k = 0;
-  while ((1u << k) < w || (1u << k) < h) {
-    k += 1;
-  }
-  window_fill(e, (u32*)win->img->data, w, h, image, k);
+  window_fill(e, (u32*)win->img->data, w, h, image, window_k(w, h));
   window_pace();
   XPutImage(win->dpy, win->win, DefaultGC(win->dpy, DefaultScreen(win->dpy)),
     win->img, 0, 0, 0, 0, w, h);
@@ -348,6 +338,30 @@ static Term window_frame(Env e, intptr_t at, Term image) {
   Term list = window_list(e, win->evs, win->n);
   win->n = 0;
   return list;
+}
+
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten/threading.h>
+#ifndef BendWin
+#define BendWin BendWin
+typedef struct { u32 w; u32 h; u32* pix; u32 cap; u32* evs; u32 got; } BendWin;
+#endif
+
+static Term window_frame(Env e, intptr_t at, Term image) {
+  BendWin* win = (BendWin*)at;
+  io_sync();
+  window_host(e.mem, image, win->w, win->h, window_k(win->w, win->h), win->pix);
+  for (u32 i = 0; i < win->w * win->h; i += 1) {
+    u32 c = win->pix[i];
+    win->pix[i] = 0xFF000000 | c >> 16 | (c & 0xFF00) | c << 16 & 0xFF0000;
+  }
+  a32_store(&win->got, 0);
+  MAIN_THREAD_ASYNC_EM_ASM({ window_js_show($0, $1, $2, $3, $4, $5); },
+    win->pix, win->w, win->h, win->evs, win->cap, &win->got);
+  while (a32_load_acq(&win->got) == 0) {
+    emscripten_futex_wait(&win->got, 0, 1000);
+  }
+  return window_list(e, win->evs, win->got - 1);
 }
 
 #else

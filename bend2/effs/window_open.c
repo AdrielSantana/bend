@@ -124,9 +124,6 @@ static id<MTLDevice> window_dev;
 
 static u32 window_make(const char* title, u32 w, u32 h, intptr_t* out,
   const char** why) {
-  if (w < 1 || h < 1 || w > 16384 || h > 16384) {
-    return EINVAL;
-  }
   if (NSScreen.screens.count == 0) {
     *why = "Window.open: no display (build a native binary with bend <file> -o <out> and run it from a desktop session)";
     return ENOTSUP;
@@ -201,9 +198,6 @@ typedef struct {
 
 static u32 window_make(const char* title, u32 w, u32 h, intptr_t* out,
   const char** why) {
-  if (w < 1 || h < 1 || w > 16384 || h > 16384) {
-    return EINVAL;
-  }
   Display* dpy = XOpenDisplay(NULL);
   if (dpy == NULL) {
     *why = "Window.open: no display (build a native binary with bend <file> -o <out> and run it from a desktop session)";
@@ -236,6 +230,108 @@ static u32 window_make(const char* title, u32 w, u32 h, intptr_t* out,
   return 0;
 }
 
+#elif defined(__EMSCRIPTEN__)
+#ifndef BendWin
+#define BendWin BendWin
+#include <emscripten.h>
+typedef struct { u32 w; u32 h; u32* pix; u32 cap; u32* evs; u32 got; } BendWin;
+#endif
+
+// The page's <canvas id="bend"> and its listeners, on the main thread: the
+// program runs on a worker. Events are the Mac's five words, its key codes
+// (a character in lower case, a function key's private-use character,
+// 65536 + a modifier's key code) and buttons (0 left, 1 right, 2 middle).
+EM_JS(void, window_js_open, (const char* title, u32 w, u32 h), {
+  var c = document.getElementById("bend");
+  c.width  = w;
+  c.height = h;
+  Module.bendCtx = c.getContext("2d");
+  Module.bendImg = new ImageData(w, h);
+  document.title = UTF8ToString(title);
+  var evs = Module.bendEvs;
+  if (!evs) {
+    evs = Module.bendEvs = [];
+    var put = function(k, a, b, c, d) {
+      if (evs.length < 5120) {
+        evs.push(k, a, b, c, d);
+      }
+    };
+    var keys = { Escape: 27, Enter: 13, Tab: 9, Backspace: 127,
+      ArrowUp: 63232, ArrowDown: 63233, ArrowLeft: 63234, ArrowRight: 63235,
+      Insert: 63271, Delete: 63272, Home: 63273, End: 63275, PageUp: 63276,
+      PageDown: 63277, MetaRight: 65590, MetaLeft: 65591, ShiftLeft: 65592,
+      CapsLock: 65593, AltLeft: 65594, ControlLeft: 65595, ShiftRight: 65596,
+      AltRight: 65597, ControlRight: 65598 };
+    var key = function(ev, down) {
+      var k = ev.key;
+      var f = /^F([0-9]+)$/.exec(k);
+      var code = keys[ev.code] || keys[k] || (f ? 63235 + Number(f[1])
+        : k.length === 1 ? k.toLowerCase().codePointAt(0) : 65536 + ev.keyCode);
+      put(0, code, down, 0, 0);
+      if (!ev.metaKey && !ev.ctrlKey && !f) {
+        ev.preventDefault();
+      }
+    };
+    var at = function(ev) {
+      var r = c.getBoundingClientRect();
+      var x = Math.floor((ev.clientX - r.left) * c.width / r.width);
+      var y = Math.floor((ev.clientY - r.top) * c.height / r.height);
+      return [Math.max(0, Math.min(x, c.width - 1)),
+        Math.max(0, Math.min(y, c.height - 1))];
+    };
+    var mouse = function(ev, down) {
+      var p = at(ev);
+      if (ev.button < 3) {
+        put(1, p[0], p[1], [0, 2, 1][ev.button], down);
+      }
+    };
+    window.addEventListener("keydown", function(ev) { key(ev, 1); });
+    window.addEventListener("keyup", function(ev) { key(ev, 0); });
+    c.addEventListener("mousedown", function(ev) { mouse(ev, 1); });
+    window.addEventListener("mouseup", function(ev) { mouse(ev, 0); });
+    c.addEventListener("mousemove", function(ev) {
+      var p = at(ev);
+      put(2, p[0], p[1], 0, 0);
+    });
+    c.addEventListener("contextmenu", function(ev) { ev.preventDefault(); });
+  }
+  evs.length = 0;
+});
+
+// A frame on the display's next tick, as the Mac's display sync (a hidden
+// tab has no ticks)
+EM_JS(void, window_js_show, (u32* pix, u32 w, u32 h, u32* evs, u32 cap,
+  u32* got), {
+  var show = function() {
+    Module.bendImg.data.set(HEAPU8.subarray(pix, pix + w * h * 4));
+    Module.bendCtx.putImageData(Module.bendImg, 0, 0);
+    Module.bendFrames = (Module.bendFrames | 0) + 1;
+    var q = Module.bendEvs;
+    var n = Math.min(q.length / 5, cap);
+    HEAPU32.set(q.splice(0, n * 5), evs >> 2);
+    Atomics.store(HEAP32, got >> 2, n + 1);
+    Atomics.notify(HEAP32, got >> 2);
+  };
+  if (document.hidden) {
+    setTimeout(show, 16);
+  } else {
+    requestAnimationFrame(show);
+  }
+});
+
+static u32 window_make(const char* title, u32 w, u32 h, intptr_t* out,
+  const char** why) {
+  MAIN_THREAD_EM_ASM({ window_js_open($0, $1, $2); }, title, w, h);
+  BendWin* win = io_mem(calloc(1, sizeof *win));
+  win->w   = w;
+  win->h   = h;
+  win->pix = io_mem(calloc((u64)w * h, 4));
+  win->cap = 1024;
+  win->evs = io_mem(calloc(win->cap * 5, 4));
+  *out = (intptr_t)win;
+  return 0;
+}
+
 #else
 
 static u32 window_make(const char* title, u32 w, u32 h, intptr_t* out,
@@ -246,13 +342,30 @@ static u32 window_make(const char* title, u32 w, u32 h, intptr_t* out,
 
 #endif
 
+#ifndef __METAL_VERSION__
+// the quadtree level that holds w x h, and a frame filled by the host
+INLINE u32 window_k(u32 w, u32 h) {
+  u32 m = (w > h ? w : h) - 1;
+  return m ? 32 - CLZ(m) : 0;
+}
+
+INLINE void window_host(Corpus H, Term root, u32 w, u32 h, u32 k, u32* out) {
+  for (u32 i = 0; i < w * h; i += 1) {
+    out[i] = window_pix(H, root, k, i % w, i / w);
+  }
+}
+#endif
+
 Term window_open_run(Env e, Term* f, IoWork* w) {
   uint64_t n = 0;
   char* title = io_cstr(e, f[0], &n);
   intptr_t out;
   const char* why = NULL;
+  u32 wd = (u32)f[1];
+  u32 ht = (u32)f[2];
   u32 q = io_nul(title, n) ? EILSEQ
-    : window_make(title, (u32)f[1], (u32)f[2], &out, &why);
+    : wd < 1 || ht < 1 || wd > 16384 || ht > 16384 ? EINVAL
+    : window_make(title, wd, ht, &out, &why);
   free(title);
   if (q != 0) {
     return io_fail(e, q, why);

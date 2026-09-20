@@ -35,7 +35,8 @@ const HELP = `Bend ${VERSION}: check, run, build and publish Bend programs.
 
 usage:
   bend <file.bend> [args]       check the file, then run main with args
-  bend <file.bend> -o <out>     build a binary; <out>.c emits C, <out>.js JS
+  bend <file.bend> -o <out>     build a binary; <out>.c emits C, <out>.js JS,
+                                <out>.html a web page (WebAssembly; emcc)
   bend <file.bend> --check-only check the file and its imports; run nothing
   bend <file.bend> --publish    publish the file and its imports to the hub
   bend <page.html> -o <dir>     bundle a page that imports .bend files
@@ -45,6 +46,56 @@ usage:
   bend version                  print the version
 
 Read the guide (\`bend guide\`) before writing Bend code.
+`;
+
+// PAGE is the web page a build writes beside its .js and .wasm: the canvas a
+// Window draws on, a thread count to pick, its frames per second, a line per
+// print.
+const PAGE = `<!doctype html>
+<meta charset="utf-8">
+<title>NAME</title>
+<style>
+  body { margin: 16px; background: #111; color: #ccc; display: flex;
+    flex-direction: column; align-items: center; gap: 12px;
+    font: 14px/1.4 ui-monospace, monospace; }
+  canvas { max-width: 100%; image-rendering: pixelated; }
+  pre { margin: 0; white-space: pre-wrap; max-width: 100%; }
+  select { font: inherit; color: inherit; background: #222; border: 1px solid #444; }
+</style>
+<canvas id="bend"></canvas>
+<pre><select id="bend-threads"></select> threads, <span id="bend-rate"></span></pre>
+<pre id="bend-out"></pre>
+<script>
+  var cores   = navigator.hardwareConcurrency;
+  var threads = Math.min(Number(new URLSearchParams(location.search)
+    .get("threads")) || cores, cores);
+  var select  = document.getElementById("bend-threads");
+  for (var i = 1; i <= cores; i += 1) {
+    select.appendChild(new Option(i, i));
+  }
+  select.value = threads;
+  select.onchange = function() { location.search = "?threads=" + select.value; };
+  var say = function(text) {
+    document.getElementById("bend-out").append(text + "\\n");
+  };
+  var Module = {
+    arguments: ["--threads", String(threads)],
+    print: say,
+    printErr: say,
+    onExit: function(code) { say("exit " + code); },
+  };
+  if (!crossOriginIsolated) {
+    say("no threads: the page needs the Cross-Origin-Opener-Policy: "
+      + "same-origin and Cross-Origin-Embedder-Policy: require-corp headers");
+  }
+  var frames = 0;
+  setInterval(function() {
+    var n = Module.bendFrames | 0;
+    document.getElementById("bend-rate").textContent = (n - frames) + " fps";
+    frames = n;
+  }, 1000);
+</script>
+<script src="NAME.js"></script>
 `;
 
 const BASE = Bend.BASE_BEND;
@@ -301,7 +352,11 @@ function cli_emit(book: Bend.Book, out: string): void {
     const c   = path.join(dir, path.basename(out) + ".c");
     fs.writeFileSync(c, Comp.compile_book(book));
     try {
-      cli_build(out, c);
+      if (out.endsWith(".html")) {
+        cli_build_web(out, c);
+      } else {
+        cli_build(out, c);
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -371,6 +426,25 @@ function cli_build(bin: string, file: string): void {
       throw "Error: " + path.basename(cmd) + " failed to build " + bin;
     }
   }
+}
+
+// cli_build_web builds the C file at `file` into the page `page` and its .js
+// and .wasm: emcc 3.1.35+ (tail calls), the program on a worker a core (the
+// pool holds 4 more: the proxied main and the IO helpers), 2 GiB of memory.
+function cli_build_web(page: string, file: string): void {
+  const base = page.slice(0, -".html".length);
+  const emcc = process.env.EMCC || "emcc";
+  const args = ["-std=gnu11", "-O3", "-pthread", "-mtail-call", file,
+    "-sPROXY_TO_PTHREAD", "-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+4",
+    "-sINITIAL_MEMORY=2147483648", "-sENVIRONMENT=web,worker",
+    "-sEXIT_RUNTIME=1", "-o", path.resolve(base + ".js")];
+  if (child.spawnSync(emcc, args, { stdio: "inherit" }).status !== 0) {
+    throw "Error: " + emcc + " failed to build " + page
+      + " (a page needs Emscripten 3.1.35+ on PATH, or at $EMCC)";
+  }
+  const name = path.basename(base).replace(/[&<"]/g, (c) =>
+    "&#" + c.charCodeAt(0) + ";");
+  fs.writeFileSync(page, PAGE.replaceAll("NAME", name));
 }
 
 // cli_base prints the base library; with --types, its type declarations
