@@ -298,24 +298,39 @@ EM_JS(void, window_js_open, (const char* title, u32 w, u32 h), {
   evs.length = 0;
 });
 
-// A frame on the display's next tick, as the Mac's display sync (a hidden
-// tab has no ticks)
+// A frame is taken off the heap when handed and shown on the display's
+// next tick (a hidden tab has no ticks). A program a frame ahead of the
+// display waits for that tick, as the Mac's nextDrawable waits for a free
+// drawable, and no longer: a frame late for a tick does not wait for the
+// next one.
 EM_JS(void, window_js_show, (u32* pix, u32 w, u32 h, u32* evs, u32 cap,
   u32* got), {
-  var show = function() {
+  var take = function() {
     Module.bendImg.data.set(HEAPU8.subarray(pix, pix + w * h * 4));
-    Module.bendCtx.putImageData(Module.bendImg, 0, 0);
-    Module.bendFrames = (Module.bendFrames | 0) + 1;
     var q = Module.bendEvs;
     var n = Math.min(q.length / 5, cap);
     HEAPU32.set(q.splice(0, n * 5), evs >> 2);
     Atomics.store(HEAP32, got >> 2, n + 1);
     Atomics.notify(HEAP32, got >> 2);
+    var show = Module.bendDue = function() {
+      var next = Module.bendNext;
+      Module.bendCtx.putImageData(Module.bendImg, 0, 0);
+      Module.bendFrames = (Module.bendFrames | 0) + 1;
+      Module.bendDue = Module.bendNext = null;
+      if (next) {
+        next();
+      }
+    };
+    if (document.hidden) {
+      setTimeout(show, 16);
+    } else {
+      requestAnimationFrame(show);
+    }
   };
-  if (document.hidden) {
-    setTimeout(show, 16);
+  if (Module.bendDue) {
+    Module.bendNext = take;
   } else {
-    requestAnimationFrame(show);
+    take();
   }
 });
 
