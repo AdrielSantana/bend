@@ -1892,6 +1892,7 @@ typedef struct {
   u32    stop;
   u32    back;
   u32    back_words;
+  u32    fid;
 } GpuReq;
 
 typedef struct {
@@ -1941,7 +1942,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     var dev = await ad.requestDevice({ requiredLimits: {
       maxBufferSize: L.maxBufferSize,
       maxStorageBufferBindingSize: L.maxStorageBufferBindingSize } });
-    var G = { dev: dev, bad: null, k: 16 };
+    var G = { dev: dev, bad: null, ks: {} };
     dev.addEventListener("uncapturederror", function(ev) {
       G.bad = G.bad || ev.error.message;
       console.error("bend: WebGPU: " + ev.error.message);
@@ -2004,8 +2005,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
   })().catch(function(e) { end(2, String(e)); });
 });
 
-// The rounds, as many a submit as the last bang planned (the count after
-// the stop word; 16 at first) and doubling to 256, the header read back
+// The rounds, as many a submit as the last bang of the same function
+// planned (the count after the stop word; 16 at first) and doubling to 256, the header read back
 // after each submit until its stop word is set. A wait on the header costs
 // about a millisecond, and so do some twenty rounds past the stop.
 EM_JS(void, webgpu_js_run, (GpuReq* q), {
@@ -2034,7 +2035,7 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
     }
     enc.clearBuffer(G.M, w(13) * 8, w(14) * 8);
     enc.clearBuffer(G.P, w(13) * 8, w(14) * 8);
-    for (var k = G.k; !G.bad; k = Math.min(k * 2, 256)) {
+    for (var k = G.ks[w(18)] || 16; !G.bad; k = Math.min(k * 2, 256)) {
       var pass = enc.beginComputePass();
       for (var r = 0; r < k; r += 1) {
         pass.setPipeline(G.plan);
@@ -2055,7 +2056,7 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
       var used = h[2 * w(15) + 2] + 1;
       G.head.unmap();
       if (stop) {
-        G.k = Math.min(used, 256);
+        G.ks[w(18)] = Math.min(used, 256);
         return end(1);
       }
       enc = G.dev.createCommandEncoder();
@@ -2294,6 +2295,7 @@ static void gpu_pass(u32 f) {
   q->stop       = WG_STOP;
   q->back       = (u32)(uintptr_t)gpu_head;
   q->back_words = GPU_HEAD;
+  q->fid        = fid;
   gpu_ask(q, true);
   if ((u32)gpu_head[H_ERROR_CODE] != 0) {
     err_post(H, (u32)gpu_head[H_ERROR_CODE]);
