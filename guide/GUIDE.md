@@ -165,7 +165,8 @@ share also sets the speed: a `+` value read by every lane costs an atomic per
 read. Read `bend guide shaders` before you write a parallel app.
 
 The JavaScript target ignores all that and just runs sequentially; a web
-page built with `-o file.html` runs it on every core, as a binary does.
+page built with `-o file.html` runs on every core, as a binary does, and its
+`!` on WebGPU where the browser has it.
 
 ### Arrays
 
@@ -511,7 +512,8 @@ must stay beside it: on macOS it needs Metal, on Linux CUDA 12 at
 `/usr/local/cuda`. On Linux a program with a Window needs `libx11-dev`, one
 with Audio `libasound2-dev`. A page (`-o file.html`, its .js and .wasm
 beside it) is the runtime as WebAssembly on a worker per core (a `!` runs on
-them) with a Window on its canvas; it needs Emscripten 3.1.35+ and a server
+WebGPU, or on them where the browser has none or the address says
+`?gpu=off`) with a Window on its canvas; it needs Emscripten 3.1.35+ and a server
 sending `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp`, since threads need cross-origin
 isolation. `bend guide` prints this text, `bend base` prints

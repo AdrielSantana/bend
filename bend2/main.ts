@@ -22,6 +22,7 @@ import type { BunPlugin } from "bun";
 
 import * as Bend from "./bend.ts";
 import * as Comp from "./comp.ts";
+import * as Wgsl from "./wgsl.ts";
 
 // Main
 // ====
@@ -50,7 +51,7 @@ Read the guide (\`bend guide\`) before writing Bend code.
 
 // PAGE is the web page a build writes beside its .js and .wasm: the canvas a
 // Window draws on, a thread count to pick, its frames per second, a line per
-// print.
+// print. ?gpu=off runs a ! on the cores.
 const PAGE = `<!doctype html>
 <meta charset="utf-8">
 <title>NAME</title>
@@ -67,19 +68,23 @@ const PAGE = `<!doctype html>
 <pre id="bend-out"></pre>
 <script>
   var cores   = navigator.hardwareConcurrency;
-  var threads = Math.min(Number(new URLSearchParams(location.search)
-    .get("threads")) || cores, cores);
+  var query   = new URLSearchParams(location.search);
+  var threads = Math.min(Number(query.get("threads")) || cores, cores);
   var select  = document.getElementById("bend-threads");
   for (var i = 1; i <= cores; i += 1) {
     select.appendChild(new Option(i, i));
   }
   select.value = threads;
-  select.onchange = function() { location.search = "?threads=" + select.value; };
+  select.onchange = function() {
+    query.set("threads", select.value);
+    location.search = query;
+  };
   var say = function(text) {
     document.getElementById("bend-out").append(text + "\\n");
   };
   var Module = {
-    arguments: ["--threads", String(threads)],
+    arguments: ["--threads", String(threads)].concat(query.get("gpu")
+      ? ["--gpu", query.get("gpu")] : []),
     print: say,
     printErr: say,
     onExit: function(code) { say("exit " + code); },
@@ -91,7 +96,8 @@ const PAGE = `<!doctype html>
   var frames = 0;
   setInterval(function() {
     var n = Module.bendFrames | 0;
-    document.getElementById("bend-rate").textContent = (n - frames) + " fps";
+    document.getElementById("bend-rate").textContent = (n - frames) + " fps"
+      + (Module.bendGpu ? ", ! on WebGPU" : "");
     frames = n;
   }, 1000);
 </script>
@@ -431,10 +437,15 @@ function cli_build(bin: string, file: string): void {
 // cli_build_web builds the C file at `file` into the page `page` and its .js
 // and .wasm: emcc 3.1.35+ (tail calls), the program on a worker a core (the
 // pool holds 4 more: the proxied main and the IO helpers), 2 GiB of memory.
+// A `!` program carries its WebGPU lane (bend2/wgsl.ts, from clang's AST of
+// the device C) and runs the ! on the cores where the browser has none.
 function cli_build_web(page: string, file: string): void {
   const base = page.slice(0, -".html".length);
   const emcc = process.env.EMCC || "emcc";
-  const args = ["-std=gnu11", "-O3", "-pthread", "-mtail-call", file,
+  const c    = fs.readFileSync(file, "utf8");
+  const gpu  = /^#define BANGS\s+0$/m.test(c) ? [] : ["-DBEND_WEBGPU=\""
+    + Wgsl.webgpu_page(c, path.dirname(file), cc_find(false)) + "\""];
+  const args = ["-std=gnu11", "-O3", "-pthread", "-mtail-call", file, ...gpu,
     "-sPROXY_TO_PTHREAD", "-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+4",
     "-sINITIAL_MEMORY=2147483648", "-sENVIRONMENT=web,worker",
     "-sEXIT_RUNTIME=1", "-o", path.resolve(base + ".js")];

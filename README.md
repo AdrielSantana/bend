@@ -232,8 +232,8 @@ def add_zero(x):
 - Targets are C, Metal, CUDA, JavaScript and WebAssembly; Lua, Luau and Python
   are planned.
 - The JavaScript target runs on one core and has no graphics or audio. The
-  WebAssembly target (a page) runs on every core and has a window, but no
-  audio, files or sockets yet.
+  WebAssembly target (a page) runs on every core, its `!` on WebGPU, and has a
+  window, but no audio, files or sockets yet.
 - Parallelism requires balanced calls. Flexible parallelism will be added later.
 - Sharing arrays with atomics across threads is experimental and needs `@unsafe`.
 - One GPU per program, one event loop, and no multi-machine execution yet.
@@ -244,7 +244,8 @@ def add_zero(x):
 - The compiler (not kernel) is 99% AI-written and has not been fully audited yet.
 - The Lean formalization and bend.ts mismatch. Early consistency bugs may occur.
 - A binary needs clang 14+; ! needs 19+, Metal or CUDA 12. A page needs
-  Emscripten 3.1.35+ and a server with the COOP and COEP headers.
+  Emscripten 3.1.35+ (and clang 19+ with `!`) and a server with the COOP and
+  COEP headers.
 - No Windows (WSL works); on Linux, Window and Audio need X11 and ALSA headers.
 - The hub has no names, versions, accounts or search yet. Packages are hashes.
 - Error messages are terse; no debugger, profiler or REPL.

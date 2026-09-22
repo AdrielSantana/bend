@@ -5238,6 +5238,10 @@ static void gpu_pass(u32 f) {
   }
 }
 
+#elif defined(BEND_WEBGPU)
+
+#include BEND_WEBGPU
+
 #else
 
 #define gpu_probe() false
