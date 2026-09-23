@@ -167,6 +167,12 @@ const WG_DEFS = `
 // same kid of neighbouring parents (raytrace's hashed columns, alike in
 // every row, cost alike).
 //
+// A lane that ran out of heap runs on over nodes that alias until it sees
+// the error, and its stray writes can land in the header: no loop here
+// trusts a count past the queue's room or runs on past an error: a
+// dispatch that does not end can hold the GPU and the screen with it (a
+// Mac froze, 2026-09-23, while a page's heap ran out bang after bang).
+//
 // Once the root is done, the rounds pack: they copy what the root's words
 // reach into R, from the first page the rounds left unused, so the host
 // reads R alone. A job is a word to copy and where to (src << 32 | dst). A
@@ -354,7 +360,7 @@ static void wg_roots(Corpus H) {
   u32 n = 0;
   a32_store(a32_at(H, WG_PACK), 1);
   H[WG_PR0] = HEAP_OFF + ((Loc)a32_load(a32_at(H, H_BUMP)) << PAGE_BITS);
-  for (u32 j = 0; j + 1 < a32_load(a32_at(H, H_ROOT_DONE)); j += 1) {
+  for (u32 j = 0; j < WL_RESW && j + 1 < a32_load(a32_at(H, H_ROOT_DONE)); j += 1) {
     Loc w = H_ROOT_WORD + j;
     if (!term_triv(H[w])) {
       wg_push(H, (w << 32) | w, n);
@@ -373,6 +379,9 @@ static u32 wg_plan(Corpus H) {
   }
   u32 n = a32_load(a32_at(H, WG_NOUT));
   u32 m = n < LANES ? n : LANES;
+  if (n > WG_QCAP) {
+    err_post(H, ERR_RING);
+  }
   if (n == 0 || err_seen(H)) {
     a32_store(a32_at(H, WG_STOP), 1);
     return 0;
@@ -424,7 +433,7 @@ static void wg_run(Corpus H, u32 i) {
   u32 n    = a32_load(a32_at(H, WG_NIN));
   u32 seq  = a32_load(a32_at(H, WG_SEQ));
   u32 side = a32_load(a32_at(H, WG_SIDE));
-  for (u32 j = i; j < n; j = a32_add(a32_at(H, WG_GRAB), 1)) {
+  for (u32 j = i; j < n && !err_seen(H); j = a32_add(a32_at(H, WG_GRAB), 1)) {
     wg_task(H, i, wg_q(H, side)[j], seq);
   }
 }
@@ -437,7 +446,7 @@ static void wg_packs(Corpus H, u32 i) {
   u32 side = a32_load(a32_at(H, WG_SIDE));
   Loc r0   = H[WG_PR0];
   Loc end  = HEAP_OFF + ((Loc)a32_load(a32_at(H, H_CAP)) << PAGE_BITS);
-  for (u32 j = i; j < n; j = a32_add(a32_at(H, WG_GRAB), 1)) {
+  for (u32 j = i; j < n && !err_seen(H); j = a32_add(a32_at(H, WG_GRAB), 1)) {
     wg_pack(H, wg_q(H, side)[j], r0, end);
   }
 }
