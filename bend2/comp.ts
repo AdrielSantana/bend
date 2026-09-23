@@ -3385,6 +3385,9 @@ using namespace metal;
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 #ifdef __OBJC__
 // #include, not #import: bend -o reads an #import as an effect's framework
 #include <Metal/Metal.h>
@@ -6238,8 +6241,16 @@ int main(int argc, char** argv) {
     cli_fail("--gpu on, but this binary found no GPU device", NULL);
   }
   Corpus H  = corpus_setup(dev, thr > 0 ? thr : cpu_count(), mem);
+#ifdef __EMSCRIPTEN__
+  u64  t0   = io_tick();
+#endif
   int code  = io_loop(H);
   io_sync();
+#ifdef __EMSCRIPTEN__
+  // The page shows how long the program ran, its setup and GPU's opening
+  // aside, to compare where its ! ran.
+  MAIN_THREAD_EM_ASM({ Module.bendRan = $0; }, (io_tick() - t0) / 1e6);
+#endif
   return code;
 }
 

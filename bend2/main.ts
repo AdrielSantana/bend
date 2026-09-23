@@ -52,7 +52,7 @@ Read the guide (\`bend guide\`) before writing Bend code.
 // PAGE is the web page a build writes beside its .js and .wasm: the canvas a
 // Window draws on, where its ! runs (WebGPU, or ?gpu=off and a count of the
 // cores' threads, a reload since the runtime sizes its pool at start), its
-// frames per second, a line per print.
+// frames per second, how long it ran once it ends, a line per print.
 const PAGE = `<!doctype html>
 <meta charset="utf-8">
 <title>NAME</title>
@@ -96,20 +96,26 @@ const PAGE = `<!doctype html>
       ? ["--gpu", query.get("gpu")] : []),
     print: say,
     printErr: say,
-    onExit: function(code) { say("exit " + code); },
+    onExit: function(code) {
+      say("exit " + code);
+      rate();
+    },
   };
   if (!crossOriginIsolated) {
     say("no threads: the page needs the Cross-Origin-Opener-Policy: "
       + "same-origin and Cross-Origin-Embedder-Policy: require-corp headers");
   }
   var frames = 0;
-  setInterval(function() {
+  var rate = function() {
     var n = Module.bendFrames | 0;
     document.getElementById("bend-rate").textContent = [n > 0 ? n - frames
-      + " fps" : "", Module.bendCores ? "the ! on the cores: " + Module.bendCores
-      : ""].filter(Boolean).join(", ");
+      + " fps" : "", Module.bendRan === undefined ? "" : "ran "
+      + Module.bendRan.toFixed(1) + " ms", Module.bendCores
+      ? "the ! on the cores: " + Module.bendCores : ""].filter(Boolean)
+      .join(", ");
     frames = n;
-  }, 1000);
+  };
+  setInterval(rate, 1000);
 </script>
 <script src="NAME.js"></script>
 `;
