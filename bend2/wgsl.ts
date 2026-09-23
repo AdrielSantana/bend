@@ -2256,9 +2256,25 @@ static void seam_run(Seam* s) {
   }
 }
 
+// A bang's task and the arguments its def owns, dropped where they are:
+// the device has copies. The boxes it borrows (BANG_BRW) stay the
+// caller's, which drops them again later.
+static void seam_sink(Env e, Fid fid, Loc a, u32 ar) {
+  for (u32 j = 0; j < ar; j += 1) {
+    bool brw = false;
+    for (u32 i = 0; i < BANG_BRWS; i += 1) {
+      brw = brw || (BANG_BRW[2 * i] == fid && BANG_BRW[2 * i + 1] == j);
+    }
+    if (!brw) {
+      term_sink(e, e.mem[a + j]);
+    }
+  }
+  heap_free(e, cls_fit(ar + 2), a);
+}
+
 // The bang cube_run hands the GPU: its task alone on the host's ring 0. A
-// def that returns Unit gives Unit{} (fid_unit), so its bang frees its
-// arguments where they are: the device would free a copy of them.
+// def that returns Unit gives Unit{} (fid_unit), so its bang needs no
+// device.
 static void gpu_pass(u32 f) {
   Corpus H   = CORPUS;
   Env    e   = { H, ALC[0] };
@@ -2270,10 +2286,7 @@ static void gpu_pass(u32 f) {
   u32    ar  = fid_arity(fid);
   Loc    a   = term_loc(t);
   if (fid_unit(fid)) {
-    for (u32 j = 0; j < ar; j += 1) {
-      term_sink(e, H[a + j]);
-    }
-    heap_free(e, cls_fit(ar + 2), a);
+    seam_sink(e, fid, a, ar);
     H[H_ROOT_WORD] = term_pak(CID_UNIT, 0);
     a32_store_rel(a32_at(H, H_ROOT_DONE), 2);
     return;
@@ -2291,10 +2304,7 @@ static void gpu_pass(u32 f) {
   seam_run(s);
   seam_dst(s, tl + ar)     = TERM_HOLE;
   seam_dst(s, tl + ar + 1) = 0;
-  for (u32 j = 0; j < ar; j += 1) {
-    term_sink(e, H[a + j]);
-  }
-  heap_free(e, cls_fit(ar + 2), a);
+  seam_sink(e, fid, a, ar);
   static u64 task;
   task = term_tsk(fid, tl);
   memset(gpu_head, 0, sizeof gpu_head);

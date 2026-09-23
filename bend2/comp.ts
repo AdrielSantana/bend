@@ -1184,6 +1184,13 @@ function brw_of(cb: Carb, k: Bend.Name): boolean[] {
   });
 }
 
+// A def's borrowed boxes, word by word as its segment takes them.
+function brw_words(cb: Carb, k: Bend.Name): boolean[] {
+  const brw = brw_of(cb, k);
+  return sig_def(cb, k).lays.flatMap((l, i) =>
+    l.ks.map((w) => brw[i] && w === "box"));
+}
+
 function def_raise(book: Bend.Book, t: HTerm, left: number): number {
   const s = term_strip(t);
   if (s.$ === "Lam") {
@@ -2951,6 +2958,13 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     s.frame === null ? 0 : s.params.length - s.frame.at.length));
   table("CID_ARITY_T", [...fl.cids.values()]);
   table("CID_HOT_T", [...fl.cids.keys()].map((k) => Number(fl.hot.has(k))));
+  // A bang's task words its def borrows, as (fid, word) pairs: the caller
+  // keeps them, so a page, which hands the device copies, frees the rest.
+  const brw = entries.filter((s) => fl.bangs.has(s.def)).flatMap((s) =>
+    brw_words(fl, s.def).flatMap((b, j) => b ? [s.fid, j] : []));
+  defs.push("#if !DEVICE", `#define BANG_BRWS ${brw.length / 2}`,
+    `static const u32 BANG_BRW[] = { ${[...brw, 0].join(", ")} };`,
+    "#endif");
   defs.push(`#define STAT_LEN ${fl.img.length}`, "");
   // One bank for both lanes, as wide as the widest segment or return; rp
   // pads the host's twelfth slot so rax stays free for the tail call.
