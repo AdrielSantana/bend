@@ -2237,7 +2237,10 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     Atomics.notify(HEAP32, q >> 2);
   };
   (async function() {
-    var ad = navigator.gpu && await navigator.gpu.requestAdapter();
+    // A laptop with two GPUs hands out its integrated one by default, the
+    // one that also draws the screen.
+    var ad = navigator.gpu && await navigator.gpu.requestAdapter({
+      powerPreference: "high-performance" });
     if (!ad) {
       return end(2, "no WebGPU adapter");
     }
