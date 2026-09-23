@@ -138,6 +138,7 @@ const WG_DEFS = `
 #define WG_GRAB  6
 #define WG_STOP  7
 #define WG_ROUND 8
+#define WG_ORD   9
 #define WG_QCAP  (65535u * 64u)
 #define wg_qat(s)  (RING_OFF + (u64)(s) * WG_QCAP)
 #define wg_q(H, s) ((H) + wg_qat(s))
@@ -147,11 +148,14 @@ const WG_DEFS = `
 // the next dispatch, a lane a task up to the lanes, 0 when the root is
 // done, an error was posted or nothing is queued. A lane runs its task, as
 // monk_step does, then takes the next one nobody took, and queues what
-// each leaves: a ready parent, a fork's kids. A fork's kids take adjacent
-// slots, so a SIMD group runs neighbours, whose rays read the same blocks:
-// with a slot a kid Bendcraft's frame took 2 to 3 times as long. Tasks fork
-// until there are four for each lane, then run whole, so the lanes finish
-// together. Every handoff crosses a dispatch.
+// each leaves: a ready parent, a fork's kids. Tasks fork until there are
+// four for each lane, then run whole, so the lanes finish together. Every
+// handoff crosses a dispatch. The order a SIMD group runs its tasks in is
+// worth 2 to 3 times, and which one wins is the program's: with WG_ORD a
+// fork's kids take adjacent slots, so a group runs neighbours (Bendcraft's
+// rays read the same blocks); without it a slot a kid, so a group runs the
+// same kid of neighbouring parents (raytrace's hashed columns, alike in
+// every row, cost alike).
 const ROUNDS = WG_DEFS + `
 static void wg_push(Corpus H, Term t, u32 at) {
   if (at >= WG_QCAP) {
@@ -192,14 +196,21 @@ static void wg_task(Corpus H, u32 i, Term t, u32 seq) {
     wg_push(H, r, a32_add(a32_at(H, WG_NOUT), 1));
     return;
   }
-  u32 n = 0;
-  for (u32 j = 0; j < ar; j += 1) {
-    n += term_tag(H[loc + j]) == TAG_TSK;
+  bool adj = a32_load(a32_at(H, WG_ORD)) != 0;
+  u32  at  = 0;
+  if (adj) {
+    u32 n = 0;
+    for (u32 j = 0; j < ar; j += 1) {
+      n += term_tag(H[loc + j]) == TAG_TSK;
+    }
+    at = a32_add(a32_at(H, WG_NOUT), n);
   }
-  u32 at = a32_add(a32_at(H, WG_NOUT), n);
   for (u32 j = 0; j < ar; j += 1) {
     Term k = H[loc + j];
     if (term_tag(k) == TAG_TSK) {
+      if (!adj) {
+        at = a32_add(a32_at(H, WG_NOUT), 1);
+      }
       H[loc + j] = TERM_HOLE;
       wg_push(H, k, at);
       at += 1;
@@ -1903,6 +1914,7 @@ typedef struct {
   u32    back;
   u32    back_words;
   u32    fid;
+  u32    ord;
 } GpuReq;
 
 typedef struct {
@@ -1952,7 +1964,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     var dev = await ad.requestDevice({ requiredLimits: {
       maxBufferSize: L.maxBufferSize,
       maxStorageBufferBindingSize: L.maxStorageBufferBindingSize } });
-    var G = { dev: dev, bad: null, ks: {} };
+    var G = { dev: dev, bad: null, ks: {}, ords: {} };
     dev.addEventListener("uncapturederror", function(ev) {
       G.bad = G.bad || ev.error.message;
       console.error("bend: WebGPU: " + ev.error.message);
@@ -2018,7 +2030,9 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
 // The rounds, as many a submit as the last bang of the same function
 // planned (the count after the stop word; 16 at first) and doubling to 256, the header read back
 // after each submit until its stop word is set. A wait on the header costs
-// about a millisecond, and so do some twenty rounds past the stop.
+// about a millisecond, and so do some twenty rounds past the stop. The
+// first four bangs of a function alternate the kids' order (WG_ORD), from
+// a slot a kid, and the later ones keep the order of the fastest.
 EM_JS(void, webgpu_js_run, (GpuReq* q), {
   var G = Module.bendGpu;
   var w = function(k) { return HEAPU32[(q >> 2) + k]; };
@@ -2039,6 +2053,10 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
         enc.copyBufferToBuffer(G.M, at, G.P, at, n);
       }
     }
+    var o = G.ords[w(18)] || (G.ords[w(18)] = { n: 0, t: [Infinity, Infinity] });
+    var ord = o.n < 4 ? o.n & 1 : Number(o.t[1] < o.t[0]);
+    dq.writeBuffer(G.M, w(19) * 8, new Uint32Array([ord]));
+    var t0 = performance.now();
     if (!G.head || G.head.size < bw) {
       G.head = G.dev.createBuffer({ size: bw,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
@@ -2067,6 +2085,8 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
       G.head.unmap();
       if (stop) {
         G.ks[w(18)] = Math.min(used, 256);
+        o.t[ord] = Math.min(o.t[ord], performance.now() - t0);
+        o.n += 1;
         return end(1);
       }
       enc = G.dev.createCommandEncoder();
@@ -2327,6 +2347,7 @@ static void gpu_pass(u32 f) {
   q->back       = (u32)(uintptr_t)gpu_head;
   q->back_words = GPU_HEAD;
   q->fid        = fid;
+  q->ord        = WG_ORD;
   gpu_ask(q, true);
   if ((u32)gpu_head[H_ERROR_CODE] != 0) {
     err_post(H, (u32)gpu_head[H_ERROR_CODE]);
