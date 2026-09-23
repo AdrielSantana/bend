@@ -2237,7 +2237,7 @@ static u64    gpu_live;
 #define gpu_load(b)
 
 EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
-  GpuReq* q, u32 win, u32 pix, u32 least, u32 start), {
+  GpuReq* q, u32 win, u32 pix, u32 least, u32 start, u32 lines), {
   var end = function(v, why) {
     if (why) {
       Module.bendOn = "the ! on the cores: " + why;
@@ -2247,6 +2247,14 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     Atomics.notify(HEAP32, q >> 2);
   };
   (async function() {
+    // Direct3D's compilers inline every call and take about 0.1 ms a line
+    // of the result (Chrome on Windows, an RTX 3050): Fly's run, 23
+    // thousand lines, compiled in 2.7 s; Slash Boss's, 2.1 million, not in
+    // five minutes, and the page waited on it with nothing to show.
+    if (/Windows/.test(navigator.userAgent) && lines > 100000) {
+      return end(2, "too long for Direct3D to compile: "
+        + lines.toLocaleString("en") + " lines once every call is inlined");
+    }
     // A laptop with two GPUs hands out its integrated one by default, the
     // one that also draws the screen; a software adapter (SwiftShader, let
     // through by a flag) runs the rounds on the CPU, slower than the cores.
@@ -2545,8 +2553,9 @@ static void gpu_ask(GpuReq* q, bool run) {
 
 static bool gpu_probe(void) {
   MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5, $6,
-    $7); }, GPU_SRC, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req, WG_WIN,
-    (u32)wg_qat(2), (u32)(GPU_IMG + CUBE * PAGE_LEN), (u32)GPU_START);
+    $7, $8); }, GPU_SRC, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req, WG_WIN,
+    (u32)wg_qat(2), (u32)(GPU_IMG + CUBE * PAGE_LEN), (u32)GPU_START,
+    GPU_LINES);
   bool ok = gpu_wait(&gpu_req);
   gpu_words = gpu_req.put[0].words;
   gpu_most  = gpu_req.put[1].words;
@@ -2892,6 +2901,24 @@ static void gpu_pass(u32 f) {
 // Export
 // ======
 
+// The lines of entry once every call in it is inlined, as Direct3D's
+// compilers do: WGSL has no recursion, so the calls form a DAG, and a
+// callee shared by many callers is counted at each.
+function inlined(src: string, entry: string): number {
+  const body = new Map(src.split(/^(?=fn \w+\()/m).map((b): [string, string] =>
+    [/^fn (\w+)/.exec(b)?.[1] ?? "", b]));
+  const memo = new Map<string, number>();
+  const size = (f: string): number => {
+    const b = body.get(f)!;
+    const n = memo.get(f) ?? [...b.slice(b.indexOf("{")).matchAll(/\b(\w+)\(/g)]
+      .filter((m) => m[1] !== f && body.has(m[1]))
+      .reduce((a, m) => a + size(m[1]), b.split("\n").length);
+    memo.set(f, n);
+    return n;
+  };
+  return size(entry);
+}
+
 // The page's lane for a program with `!`: the glue, with the WGSL and
 // TAB's words it hands the browser, written into dir, and its path, for
 // the template's BEND_WEBGPU.
@@ -2904,6 +2931,8 @@ export function webgpu_page(c: string, dir: string, cc = "clang"): string {
   const glue = path.join(dir, "webgpu.c");
   fs.writeFileSync(glue, "static const char GPU_SRC[] =\n"
     + src.map((l) => JSON.stringify(l + "\n")).join("\n") + ";\n\n"
-    + "static const u32 GPU_TAB[] = { " + tab.join(", ") + " };\n" + GLUE);
+    + "static const u32 GPU_TAB[] = { " + tab.join(", ") + " };\n"
+    + "#define GPU_LINES " + Math.min(inlined(src.join("\n"), "run"),
+      2 ** 31 - 1) + "u\n" + GLUE);
   return glue;
 }
