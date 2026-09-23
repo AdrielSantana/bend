@@ -139,6 +139,16 @@ const WG_DEFS = `
 #define WG_STOP  7
 #define WG_ROUND 8
 #define WG_ORD   9
+#define WG_PACK  10
+#define WG_PR0   11
+#define WG_PTOP  12
+#define WG_PEND  0xFFFFFFFFu
+#define WG_FWD   0x80000000u
+#define WG_CHUNK 256u
+#define WG_RING  16u
+#define WG_BUDGET 64u
+#define WG_BLK   (1ull << 63)
+#define WG_LOCS  0x7FFFFFFFull
 #define WG_QCAP  (65535u * 64u)
 #define wg_qat(s)  (RING_OFF + (u64)(s) * WG_QCAP)
 #define wg_q(H, s) ((H) + wg_qat(s))
@@ -156,6 +166,18 @@ const WG_DEFS = `
 // rays read the same blocks); without it a slot a kid, so a group runs the
 // same kid of neighbouring parents (raytrace's hashed columns, alike in
 // every row, cost alike).
+//
+// Once the root is done, the rounds pack: they copy what the root's words
+// reach into R, from the first page the rounds left unused, so the host
+// reads R alone. A job is a word to copy and where to (src << 32 | dst). A
+// lane walks a job's nodes depth first, as many as a budget, and queues
+// the rest, so a tree spreads a round at a time and a job's nodes lie
+// together in R. A shared cell is copied by the lane that claims its high
+// word (WG_PEND), which then holds the copy (WG_FWD | loc): a reference
+// that finds it claimed takes the copy a round later. A bang's cells count
+// what the result holds of them, so a copy keeps its count. A block is
+// copied a chunk a lane: a chunk's job is WG_BLK, a bit for words alone,
+// its source and its destination.
 const ROUNDS = WG_DEFS + `
 static void wg_push(Corpus H, Term t, u32 at) {
   if (at >= WG_QCAP) {
@@ -165,13 +187,190 @@ static void wg_push(Corpus H, Term t, u32 at) {
   wg_q(H, a32_load(a32_at(H, WG_SIDE)) ^ 1)[at] = t;
 }
 
+static Loc wg_room(Corpus H, u32 words, Loc r0, Loc end) {
+  Loc r = r0 + a32_add(a32_at(H, WG_PTOP), words);
+  if (r + words > end) {
+    err_post(H, ERR_HEAP);
+    return 0;
+  }
+  return r;
+}
+
+// A job's nodes, depth first from the one at s for d, WG_BUDGET at most,
+// with a ring of WG_RING fields to visit: counted (base 0), or copied into
+// R from base on. What the walk does not take is queued as jobs when it
+// copies: a cell, a block longer than a chunk, the ring's oldest field when
+// it is full, and the ring's fields at the budget. Both passes take the
+// same path, so the count is the copy's words, and a job's nodes lie
+// together in R, in the order the host walks them.
+static u32 wg_walk(Corpus H, Loc s0, Loc d0, Loc base) {
+  u64 ring[WG_RING];
+  u32 lo   = 0;
+  u32 hi   = 1;
+  u32 used = 0;
+  ring[0] = (s0 << 32) | d0;
+  for (u32 b = 0; b < WG_BUDGET && hi != lo; b += 1) {
+    hi -= 1;
+    Loc  s   = ring[hi & (WG_RING - 1)] >> 32;
+    Loc  d   = (u32)ring[hi & (WG_RING - 1)];
+    Term t   = H[s];
+    u64  tag = term_tag(t);
+    u32  aux = (u32)term_aux(t);
+    Loc  loc = term_loc(t);
+    bool blk = tag == TAG_ARR || tag == TAG_BUF;
+    if (!blk && tag != TAG_CTR && tag != TAG_CLO) {
+      err_post(H, ERR_TAGS);
+      return used;
+    }
+    u32 n  = tag == TAG_CTR ? cid_arity(aux) : tag == TAG_CLO
+      ? fid_arity(aux) - 1 : 1u << blk_span(t);
+    Loc nd = base + used;
+    used += 1u << (blk ? blk_span(t) : cls_fit(n));
+    if (base != 0) {
+      H[d] = (t & ~LOC_MASK) | nd;
+    }
+    for (u32 j = 0; j < n; j += 1) {
+      Term f  = H[loc + j];
+      u64  ft = term_tag(f);
+      u64  e  = ((loc + j) << 32) | (nd + j);
+      if (tag == TAG_BUF || term_triv(f)) {
+        if (base != 0) {
+          H[nd + j] = f;
+        }
+        continue;
+      }
+      if (term_rfc(f) || ((ft == TAG_ARR || ft == TAG_BUF)
+        && (1u << blk_span(f)) > WG_CHUNK)) {
+        if (base != 0) {
+          wg_push(H, e, a32_add(a32_at(H, WG_NOUT), 1));
+        }
+        continue;
+      }
+      if (hi - lo == WG_RING) {
+        if (base != 0) {
+          wg_push(H, ring[lo & (WG_RING - 1)], a32_add(a32_at(H, WG_NOUT), 1));
+        }
+        lo += 1;
+      }
+      ring[hi & (WG_RING - 1)] = e;
+      hi += 1;
+    }
+  }
+  if (base != 0 && hi != lo) {
+    u32 at = a32_add(a32_at(H, WG_NOUT), hi - lo);
+    for (u32 i = lo; i != hi; i += 1) {
+      wg_push(H, ring[i & (WG_RING - 1)], at + i - lo);
+    }
+  }
+  return used;
+}
+
+// The term at s for d: a word as it is, a block longer than a chunk a
+// chunk a job, else a walk counted, then copied into the room it takes.
+static void wg_node(Corpus H, Loc s, Loc d, Loc r0, Loc end) {
+  Term t   = H[s];
+  u64  tag = term_tag(t);
+  Loc  loc = term_loc(t);
+  if (term_triv(t)) {
+    H[d] = t;
+    return;
+  }
+  if ((tag == TAG_ARR || tag == TAG_BUF) && (1u << blk_span(t)) > WG_CHUNK) {
+    u32 n  = 1u << blk_span(t);
+    Loc nd = wg_room(H, n, r0, end);
+    u32 at = a32_add(a32_at(H, WG_NOUT), n / WG_CHUNK);
+    u64 bf = (u64)(tag == TAG_BUF) << 62;
+    H[d] = (t & ~LOC_MASK) | nd;
+    for (u32 c = 0; c < n && nd != 0; c += WG_CHUNK) {
+      wg_push(H, WG_BLK | bf | ((loc + c) << 31) | (nd + c), at);
+      at += 1;
+    }
+    return;
+  }
+  Loc base = wg_room(H, wg_walk(H, s, d, 0), r0, end);
+  if (base != 0) {
+    wg_walk(H, s, d, base);
+  }
+}
+
+// A chunk of a block: its words as they are, its terms each a job.
+static void wg_chunk(Corpus H, bool buf, Loc loc, Loc nd) {
+  for (u32 j = 0; j < WG_CHUNK; j += 1) {
+    Term f = H[loc + j];
+    H[nd + j] = f;
+    if (!buf && !term_triv(f)) {
+      wg_push(H, ((loc + j) << 32) | (nd + j), a32_add(a32_at(H, WG_NOUT), 1));
+    }
+  }
+}
+
+// A cell's reference at s, for d. The lane that claims the cell copies it:
+// the copy's word holds the content's term while it is walked, then the
+// cell's word, the count kept. A reference that finds the copy takes it,
+// and one that finds the cell claimed tries again a round later.
+static void wg_cell(Corpus H, Loc s, Loc d, Loc r0, Loc end) {
+  Term     t  = H[s];
+  Loc      r  = term_loc(t);
+  DEV u32* hi = a32_at(H, r) + 1;
+  u32      v  = a32_load(hi);
+  while (v < WG_FWD && a32_cmpx(hi, v, WG_PEND) != v) {
+    v = a32_load(hi);
+  }
+  if (v == WG_PEND) {
+    wg_push(H, (s << 32) | d, a32_add(a32_at(H, WG_NOUT), 1));
+    return;
+  }
+  if (v >= WG_FWD) {
+    H[d] = (t & ~LOC_MASK) | (v & ~WG_FWD);
+    return;
+  }
+  u32  lo = a32_load(a32_at(H, r));
+  Loc  c  = wg_room(H, 1, r0, end);
+  Term ct = (t & ~(RFC_BIT | LOC_MASK)) | ((Loc)v << 8) | (lo >> 24);
+  a32_store(hi, WG_FWD | (u32)c);
+  H[d] = (t & ~LOC_MASK) | c;
+  H[c] = ct;
+  wg_node(H, c, c, r0, end);
+  H[c] = (term_loc(H[c]) << 24) | (lo & RFC_CNT);
+}
+
+static void wg_pack(Corpus H, u64 job, Loc r0, Loc end) {
+  Loc s = job >> 32;
+  Loc d = (u32)job;
+  if (job >> 63 != 0) {
+    wg_chunk(H, (job >> 62 & 1) != 0, job >> 31 & WG_LOCS, job & WG_LOCS);
+  } else if (term_rfc(H[s])) {
+    wg_cell(H, s, d, r0, end);
+  } else {
+    wg_node(H, s, d, r0, end);
+  }
+}
+
+// The root's words as the pack's first jobs, each copied onto itself.
+static void wg_roots(Corpus H) {
+  u32 n = 0;
+  a32_store(a32_at(H, WG_PACK), 1);
+  H[WG_PR0] = HEAP_OFF + ((Loc)a32_load(a32_at(H, H_BUMP)) << PAGE_BITS);
+  for (u32 j = 0; j + 1 < a32_load(a32_at(H, H_ROOT_DONE)); j += 1) {
+    Loc w = H_ROOT_WORD + j;
+    if (!term_triv(H[w])) {
+      wg_push(H, (w << 32) | w, n);
+      n += 1;
+    }
+  }
+  a32_store(a32_at(H, WG_NOUT), n);
+}
+
 static u32 wg_plan(Corpus H) {
-  u32 n = a32_load(a32_at(H, WG_NOUT));
-  u32 m = n < LANES ? n : LANES;
   if (a32_load(a32_at(H, WG_STOP)) != 0) {
     return 0;
   }
-  if (n == 0 || root_done(H) || err_seen(H)) {
+  if (root_done(H) && a32_load(a32_at(H, WG_PACK)) == 0) {
+    wg_roots(H);
+  }
+  u32 n = a32_load(a32_at(H, WG_NOUT));
+  u32 m = n < LANES ? n : LANES;
+  if (n == 0 || err_seen(H)) {
     a32_store(a32_at(H, WG_STOP), 1);
     return 0;
   }
@@ -222,8 +421,15 @@ static void wg_run(Corpus H, u32 i) {
   u32 n    = a32_load(a32_at(H, WG_NIN));
   u32 seq  = a32_load(a32_at(H, WG_SEQ));
   u32 side = a32_load(a32_at(H, WG_SIDE));
+  u32 pack = a32_load(a32_at(H, WG_PACK));
+  Loc r0   = H[WG_PR0];
+  Loc end  = HEAP_OFF + ((Loc)a32_load(a32_at(H, H_CAP)) << PAGE_BITS);
   for (u32 j = i; j < n; j = a32_add(a32_at(H, WG_GRAB), 1)) {
-    wg_task(H, i, wg_q(H, side)[j], seq);
+    if (pack != 0) {
+      wg_pack(H, wg_q(H, side)[j], r0, end);
+    } else {
+      wg_task(H, i, wg_q(H, side)[j], seq);
+    }
   }
 }
 `;
@@ -1890,10 +2096,10 @@ fn run(@builtin(global_invocation_id) g: vec3<u32>) {
 // (BEND_WEBGPU). The device's corpus is a buffer of its own, laid out as
 // the host's, so a bang copies its task and arguments in, as an image its
 // heap starts with, runs rounds until they stop, and copies the result out
-// of the pages the device used into the host's heap (a result of words
-// alone, a Unit or a number, reads no page back). A copy walks a node
-// at a time off a stack of (term, slot) jobs and keeps a shared cell once,
-// its count the references it met. WebGPU lives on the page's main thread:
+// of R, where the rounds packed it, into the host's heap (a result of words
+// alone, a Unit or a number, reads nothing back). A copy walks a node at a
+// time off a stack of (term, slot) jobs and keeps a shared cell once, its
+// count the references it met. WebGPU lives on the page's main thread:
 // the program posts a request there and waits on its first word, 1 when
 // done and 2 when WebGPU failed (the console says why).
 const GLUE = String.raw`
@@ -2356,21 +2562,18 @@ static void gpu_pass(u32 f) {
   if (done == 0) {
     err_fail("frontier drained without a result");
   }
-  bool deep = false;
-  for (u32 j = 0; j + 1 < done; j += 1) {
-    deep = deep || !term_triv(gpu_head[H_ROOT_WORD + j]);
-  }
-  u64 len = HEAP_OFF + ((u64)(u32)gpu_head[H_BUMP] << PAGE_BITS) - GPU_IMG;
-  if (deep) {
+  u64 len = (u32)gpu_head[WG_PTOP];
+  Loc r0  = (u32)gpu_head[WG_PR0];
+  if (len > 0) {
     if (len > gpu_arena_len) {
       gpu_arena_len = len;
       gpu_arena     = seam_grow(gpu_arena, len * 8);
     }
     *q = (GpuReq){ 0 };
-    q->put[0] = (GpuPut){ GPU_IMG, (u32)(uintptr_t)gpu_arena, (u32)len };
+    q->put[0] = (GpuPut){ (u32)r0, (u32)(uintptr_t)gpu_arena, (u32)len };
     gpu_ask(q, false);
   }
-  Seam out = { gpu_arena, GPU_IMG, len, H, 0, 0, 0, e, s->job, 0,
+  Seam out = { gpu_arena, r0, len, H, 0, 0, 0, e, s->job, 0,
     s->job_cap, s->key, s->val, 0, s->key_cap };
   for (u32 j = 0; j + 1 < done; j += 1) {
     seam_job(&out, gpu_head[H_ROOT_WORD + j], H_ROOT_WORD + j);
