@@ -38,6 +38,7 @@ type Seg = {
   host?: boolean;
   spin?: boolean;
   fork?: boolean;
+  opens?: boolean;
 };
 
 type Spine = {
@@ -62,6 +63,7 @@ type Src = { refs: Set<Bend.Name>; deps: Set<Bend.Name>; flat: boolean };
 type Carb = {
   book: Book;
   bangs: Set<Bend.Name>;
+  plain: Set<Bend.Name>;
   sites: Map<Bend.Name, number>;
   hot: Set<Bend.Name>;
   stat: Set<Bend.Name>;
@@ -1455,6 +1457,7 @@ function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
   const cb: Carb = {
     book: { ...src, tlds: { ...src.tlds } },
     bangs: new Set(),
+    plain: new Set(),
     sites: new Map(),
     hot: new Set(),
     stat: new Set(),
@@ -1483,6 +1486,8 @@ function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
       if (s.$ === "Ref") {
         if (s.b) {
           cb.bangs.add(s.k);
+        } else if (s.k !== d) {
+          cb.plain.add(s.k);
         }
         if (intr_of(cb, s.k) === undefined) {
           own.refs.add(s.k);
@@ -1680,6 +1685,7 @@ function node_fields(fl: File, t: string, node: Lay,
   }
   const r = fl.brwl.get(t);
   const k = node.arms![0].k;
+  fl.seg.opens ||= k === "Qua";
   const z = r === undefined && (fl.hot.has(k) || fl.stat.has(k));
   const sp = name_local(fl, "sp");
   let fb = `e.mem[${sp} + `;
@@ -3048,6 +3054,14 @@ export function compile_book(book: Bend.Book): string {
   for (const s of fl.segs) {
     s.host = !dev.has(s.fid);
   }
+  // Does the host open an Image? Its code is what main and the closures
+  // reach, but for the defs only a bang calls, and a pure main prints its
+  // result. When no Qua is matched there, a page keeps the Images its bangs
+  // return on the device (wgsl.ts).
+  const banged = [...fl.bangs].filter((k) => !fl.plain.has(k)).map(seg_fid);
+  const host = reach([seg_fid("main"), ...fl.clos], new Set(banged));
+  const opens = show !== null || fl.segs.some((s) =>
+    s.opens && host.has(s.fid) && !banged.includes(s.fid));
   fl.spins = fl.spins.filter(([n]) => live.has(n));
   const entries = [...fl.segs, seg_new("io_emit", BOX, [""]),
     seg_new("clo_apply", BOX, ["", ""])];
@@ -3059,7 +3073,8 @@ export function compile_book(book: Bend.Book): string {
   const defs = compile_tables(fl, entries);
   defs.push(`#define MAIN_FID ${seg_fid("main")}`, `#define MAIN_PURE ${
     Number(show !== null)}`,
-    `#define BLK_SHR ${Number(cb.hot.has("t:Array"))}`);
+    `#define BLK_SHR ${Number(cb.hot.has("t:Array"))}`,
+    `#define HOST_IMAGE ${Number(opens)}`);
   const fills: [string, string[]][] = [
     ["Tables", [defs.join("\n"), ...[...fl.tabs].map(([r, i]) =>
       `CONSTV u64 TAB_${i}[] = { ${r} };`)]],
@@ -4038,6 +4053,15 @@ INLINE bool term_triv(Term t) {
   return term_tag(t) <= TAG_PAK || t == TERM_HOLE || term_loc(t) < HEAP_OFF;
 }
 
+#if defined(BEND_WEBGPU) && !DEVICE
+// A page keeps the Image a ! returns on the device, where Window.frame
+// draws it, when the host never opens one (HOST_IMAGE, wgsl.ts): the host
+// holds its term with the device's node past GPU_FAR, and a drop only
+// uncounts it.
+#define GPU_FAR (1ull << 39)
+static u32 gpu_owed;
+#endif
+
 OUTLINE Term rfc_wrap(Env e, Term t, u32 cnt) {
   if (term_tag(t) == TAG_CLO || term_tag(t) == TAG_TSK) {
     err_post(e.mem, ERR_RFCS);
@@ -4125,6 +4149,12 @@ FAR void term_drop(Env e, Term t) {
         heap_free(e, 0, r);
       }
     }
+#if defined(BEND_WEBGPU) && !DEVICE
+    if (term_tag(t) == TAG_CTR && term_loc(t) >= GPU_FAR) {
+      a32_sub(&gpu_owed, 1);
+      t = 0;
+    }
+#endif
     if (!term_triv(t)) {
       u64 tag = term_tag(t);
       if (tag == TAG_BUF) {

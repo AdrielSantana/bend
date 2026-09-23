@@ -142,6 +142,8 @@ const WG_DEFS = `
 #define WG_PACK  10
 #define WG_PR0   11
 #define WG_PTOP  12
+#define WG_KEEP  13
+#define WG_WIN   14
 #define WG_PEND  0xFFFFFFFFu
 #define WG_FWD   0x80000000u
 #define WG_CHUNK 256u
@@ -152,6 +154,11 @@ const WG_DEFS = `
 #define WG_QCAP  (65535u * 64u)
 #define wg_qat(s)  (RING_OFF + (u64)(s) * WG_QCAP)
 #define wg_q(H, s) ((H) + wg_qat(s))
+#if defined(CID_QUA) && !HOST_IMAGE
+#define WG_IMAGE CID_QUA
+#else
+#define WG_IMAGE 0x10000
+#endif
 `;
 
 // The rounds, in the runtime's own C: a plan flips the queues and sizes
@@ -183,7 +190,9 @@ const WG_DEFS = `
 // that finds it claimed takes the copy a round later. A bang's cells count
 // what the result holds of them, so a copy keeps its count. A block is
 // copied a chunk a lane: a chunk's job is WG_BLK, a bit for words alone,
-// its source and its destination.
+// its source and its destination. When the host keeps Images on the
+// device (WG_KEEP), the pack leaves an Image where the rounds built it,
+// for the host to draw it there.
 const ROUNDS = WG_DEFS + `
 static void wg_push(Corpus H, Term t, u32 at) {
   if (at >= WG_QCAP) {
@@ -191,6 +200,11 @@ static void wg_push(Corpus H, Term t, u32 at) {
     return;
   }
   wg_q(H, a32_load(a32_at(H, WG_SIDE)) ^ 1)[at] = t;
+}
+
+static bool wg_kept(Corpus H, Term t) {
+  return a32_load(a32_at(H, WG_KEEP)) != 0 && term_tag(t) == TAG_CTR
+    && !term_rfc(t) && term_aux(t) == WG_IMAGE;
 }
 
 static Loc wg_room(Corpus H, u32 words, Loc r0, Loc end) {
@@ -239,7 +253,7 @@ static u32 wg_walk(Corpus H, Loc s0, Loc d0, Loc base) {
       Term f  = H[loc + j];
       u64  ft = term_tag(f);
       u64  e  = ((loc + j) << 32) | (nd + j);
-      if (tag == TAG_BUF || term_triv(f)) {
+      if (tag == TAG_BUF || term_triv(f) || wg_kept(H, f)) {
         if (base != 0) {
           H[nd + j] = f;
         }
@@ -277,7 +291,7 @@ static void wg_node(Corpus H, Loc s, Loc d, Loc r0, Loc end) {
   Term t   = H[s];
   u64  tag = term_tag(t);
   Loc  loc = term_loc(t);
-  if (term_triv(t)) {
+  if (term_triv(t) || wg_kept(H, t)) {
     H[d] = t;
     return;
   }
@@ -453,6 +467,19 @@ static void wg_packs(Corpus H, u32 i) {
 
 static u32 wg_packing(Corpus H) {
   return a32_load(a32_at(H, WG_PACK));
+}
+
+// A kept Image's square, a lane a pixel, as the native window_dev draws
+// it: WG_WIN holds its node, then the band's width and rows, the square's
+// level and the band's first row; the pixels go to the third queue.
+static void wg_window(Corpus H, u32 i) {
+  u32 wh = a32_load(a32_at(H, WG_WIN + 1));
+  u32 kr = a32_load(a32_at(H, WG_WIN + 1) + 1);
+  u32 w  = wh & 0xFFFF;
+  if (i < w * (wh >> 16)) {
+    ((DEV u32*)wg_q(H, 2))[i] = window_pix(H, H[WG_WIN], kr & 0xFF, i % w,
+      (kr >> 8) + i / w);
+  }
 }
 `;
 
@@ -1879,6 +1906,7 @@ function device_of(ast: N): { code: string; tab: number[] } {
   inst_of(u, "wg_packing", []);
   inst_of(u, "wg_run", []);
   inst_of(u, "wg_packs", []);
+  inst_of(u, "wg_window", []);
   const fns: string[] = [];
   while (u.todo.length > 0) {
     const [inst, d, ps] = u.todo.pop()!;
@@ -2122,6 +2150,11 @@ fn run(@builtin(global_invocation_id) g: vec3<u32>) {
 fn pack(@builtin(global_invocation_id) g: vec3<u32>) {
   c_wg_packs(0u, g.x);
 }
+
+@compute @workgroup_size(64)
+fn window(@builtin(global_invocation_id) g: vec3<u32>) {
+  c_wg_window(0u, g.x);
+}
 `;
 
 // Glue
@@ -2132,11 +2165,14 @@ fn pack(@builtin(global_invocation_id) g: vec3<u32>) {
 // the host's, so a bang copies its task and arguments in, as an image its
 // heap starts with, runs rounds until they stop, and copies the result out
 // of R, where the rounds packed it, into the host's heap (a result of words
-// alone, a Unit or a number, reads nothing back). A copy walks a node at a
-// time off a stack of (term, slot) jobs and keeps a shared cell once, its
-// count the references it met. WebGPU lives on the page's main thread:
-// the program posts a request there and waits on its first word, 1 when
-// done and 2 when WebGPU failed (the console says why).
+// alone, a Unit or a number, reads nothing back). An Image stays on the
+// device when the host never opens one (HOST_IMAGE), as native Metal's
+// shared heap keeps it: Window.frame draws it there, a drop uncounts it,
+// and a later bang's copy takes it from the device's words. A copy walks a
+// node at a time off a stack of (term, slot) jobs and keeps a shared cell
+// once, its count the references it met. WebGPU lives on the page's main
+// thread: the program posts a request there and waits on its first word,
+// 1 when done and 2 when WebGPU failed (the console says why).
 const GLUE = String.raw`
 #include <emscripten.h>
 #include <emscripten/threading.h>
@@ -2174,6 +2210,7 @@ typedef struct {
   u64*       val;
   u32        keys;
   u32        key_cap;
+  bool       keep;
 } Seam;
 
 static u32    gpu_words;
@@ -2182,6 +2219,7 @@ static Seam   gpu_seam;
 static u64    gpu_head[GPU_HEAD];
 static u64*   gpu_arena;
 static u64    gpu_arena_len;
+static u64    gpu_live;
 
 #define gpu_span()  (1ull << 30)
 #define gpu_make(p) true
@@ -2258,6 +2296,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     G.plan = await pipe("plan", [b0, b1]);
     G.run  = await pipe("run", [b0]);
     G.pack = await pipe("pack", [b0]);
+    G.win  = await pipe("window", [b0]);
     G.g0 = dev.createBindGroup({ layout: b0, entries: [
       { binding: 0, resource: { buffer: G.M } },
       { binding: 1, resource: { buffer: G.T } },
@@ -2374,11 +2413,60 @@ EM_JS(void, webgpu_js_read, (GpuReq* q), {
   });
 });
 
+// A band of a kept Image's square drawn where it lives (wg_window) and its
+// rows read back into the frame, stride words apart.
+EM_JS(void, webgpu_js_window, (GpuReq* q, u32 win, u32 pix, u32 lo, u32 hi,
+  u32 a, u32 b, u32* out, u32 stride), {
+  var G = Module.bendGpu;
+  var sw = (a & 0xFFFF) * 4;
+  var n = sw * (a >>> 16);
+  var end = function(v) {
+    Atomics.store(HEAP32, q >> 2, v);
+    Atomics.notify(HEAP32, q >> 2);
+  };
+  (async function() {
+    var args = new Uint32Array([lo, hi, a, b]);
+    G.dev.queue.writeBuffer(G.M, win * 8, args);
+    G.dev.queue.writeBuffer(G.P, win * 8, args);
+    if (!G.rb || G.rb.size < n) {
+      if (G.rb) {
+        G.rb.destroy();
+      }
+      G.rb = G.dev.createBuffer({ size: Math.max(n, 1 << 20),
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    }
+    var enc = G.dev.createCommandEncoder();
+    var pass = enc.beginComputePass();
+    pass.setPipeline(G.win);
+    pass.setBindGroup(0, G.g0);
+    pass.dispatchWorkgroups(Math.ceil(n / 256));
+    pass.end();
+    enc.copyBufferToBuffer(G.M, pix * 8, G.rb, 0, n);
+    G.dev.queue.submit([enc.finish()]);
+    await G.rb.mapAsync(GPUMapMode.READ, 0, n);
+    var m = new Uint8Array(G.rb.getMappedRange(0, n));
+    for (var j = 0; j < n; j += sw) {
+      HEAPU8.set(m.subarray(j, j + sw), out + j / sw * stride * 4);
+    }
+    G.rb.unmap();
+    end(G.bad ? 2 : 1);
+  })().catch(function(e) {
+    console.error("bend: WebGPU: " + e);
+    end(2);
+  });
+});
+
 static bool gpu_wait(GpuReq* q) {
   while (a32_load_acq(&q->done) == 0) {
     emscripten_futex_wait(&q->done, 0, 1000);
   }
   return q->done == 1;
+}
+
+static void gpu_done(GpuReq* q) {
+  if (!gpu_wait(q)) {
+    err_fail("the GPU failed (WebGPU; the console says why)");
+  }
 }
 
 static void gpu_ask(GpuReq* q, bool run) {
@@ -2387,9 +2475,7 @@ static void gpu_ask(GpuReq* q, bool run) {
   } else {
     MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_read($0); }, q);
   }
-  if (!gpu_wait(q)) {
-    err_fail("the GPU failed (WebGPU; the console says why)");
-  }
+  gpu_done(q);
 }
 
 static bool gpu_probe(void) {
@@ -2406,6 +2492,18 @@ static void* seam_grow(void* p, u64 bytes) {
     err_fail("the GPU seam ran out of memory");
   }
   return p;
+}
+
+// The device's words from at on, into the arena.
+static void gpu_read(Loc at, u64 len) {
+  GpuReq* q = &gpu_req;
+  if (len > gpu_arena_len) {
+    gpu_arena_len = len;
+    gpu_arena     = seam_grow(gpu_arena, len * 8);
+  }
+  *q = (GpuReq){ 0 };
+  q->put[0] = (GpuPut){ (u32)at, (u32)(uintptr_t)gpu_arena, (u32)len };
+  gpu_ask(q, false);
 }
 
 #define seam_src(s, w) (s)->src[(w) - (s)->src_at]
@@ -2439,6 +2537,19 @@ static void seam_job(Seam* s, Term t, Loc slot) {
   s->jobs += 1;
 }
 
+// An Image the copy out keeps where it is (keep, WG_KEEP): the host holds
+// its term with the device's node past GPU_FAR.
+static bool seam_kept(Seam* s, Term t) {
+  return s->keep && term_tag(t) == TAG_CTR && term_aux(t) == WG_IMAGE;
+}
+
+static Loc seam_keep(Loc at) {
+  gpu_owed += 1;
+  return GPU_FAR | at;
+}
+
+static Loc seam_far(Seam* s, Term t, Loc at);
+
 static Loc seam_node(Seam* s, Term t, Loc at) {
   u64  tag = term_tag(t);
   u32  aux = (u32)term_aux(t);
@@ -2458,6 +2569,13 @@ static Loc seam_node(Seam* s, Term t, Loc at) {
     }
   }
   return l;
+}
+
+// A node's copy: a kept Image's from the device's words, one the copy out
+// keeps as its node there, else the node itself.
+static Loc seam_copy(Seam* s, Term t, Loc at) {
+  return at >= GPU_FAR ? seam_far(s, t, at & ~GPU_FAR)
+    : seam_kept(s, t) ? seam_keep(at) : seam_node(s, t, at);
 }
 
 // A shared cell: copied at its first reference, counted at the others.
@@ -2503,7 +2621,7 @@ static Loc seam_cell(Seam* s, Term t) {
   s->keys  += 1;
   s->key[h] = r;
   s->val[h] = seam_alloc(s, 0);
-  Loc nt = seam_node(s, t, seam_src(s, r) >> 24);
+  Loc nt = seam_copy(s, t, seam_src(s, r) >> 24);
   seam_dst(s, s->val[h]) = ((u64)nt << 24) | 1;
   return s->val[h];
 }
@@ -2513,13 +2631,30 @@ static void seam_run(Seam* s) {
     s->jobs -= 1;
     Term t    = s->job[2 * s->jobs];
     Loc  slot = s->job[2 * s->jobs + 1];
-    Loc  l    = term_rfc(t) ? seam_cell(s, t) : seam_node(s, t, term_loc(t));
+    Loc  l    = term_rfc(t) ? seam_cell(s, t) : seam_copy(s, t, term_loc(t));
     seam_dst(s, slot) = (t & ~LOC_MASK) | l;
   }
   if (s->keys > 0) {
     memset(s->key, 0, s->key_cap * 8ull);
     s->keys = 0;
   }
+}
+
+// A kept Image in a !'s argument: the device's live words come back and
+// its tree is copied from them into the argument's image, the host's term
+// left as it was.
+static Loc seam_far(Seam* s, Term t, Loc at) {
+  static Seam f;
+  gpu_read(GPU_IMG, gpu_live - GPU_IMG);
+  f = (Seam){ gpu_arena, GPU_IMG, gpu_live - GPU_IMG, s->dst, s->dst_at,
+    s->top, s->cap, s->e, f.job, 0, f.job_cap, f.key, f.val, 0, f.key_cap,
+    false };
+  Loc l = seam_node(&f, t, at);
+  seam_run(&f);
+  s->dst = f.dst;
+  s->top = f.top;
+  s->cap = f.cap;
+  return l;
 }
 
 // A bang's task and the arguments its def owns, dropped where they are:
@@ -2536,6 +2671,30 @@ static void seam_sink(Env e, Fid fid, Loc a, u32 ar) {
     }
   }
   heap_free(e, cls_fit(ar + 2), a);
+}
+
+// A kept Image's node on the device, else 0.
+static Loc gpu_far(Term t) {
+  Loc l = term_rfc(t) ? CORPUS[term_loc(t)] >> 24 : term_loc(t);
+  return term_tag(t) == TAG_CTR && l >= GPU_FAR ? l & ~GPU_FAR : 0;
+}
+
+// A kept Image's square at (x, y), of side 2^i and clipped to the w x h
+// frame, drawn where it lives, a band of rows a dispatch: only its pixels
+// come back (window_host_at's, on a page).
+static void gpu_window(Term t, u32 i, u32 x, u32 y, u32 w, u32 h, u32* out) {
+  Term n    = (t & ~(RFC_BIT | LOC_MASK)) | gpu_far(t);
+  u32  sw   = (1u << i) < w - x ? 1u << i : w - x;
+  u32  sh   = (1u << i) < h - y ? 1u << i : h - y;
+  u32  band = 65535 * 64 / sw;
+  for (u32 r = 0; r < sh; r += band) {
+    u32 rows = band < sh - r ? band : sh - r;
+    gpu_req = (GpuReq){ 0 };
+    MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_window($0, $1, $2, $3, $4, $5, $6,
+      $7, $8); }, &gpu_req, WG_WIN, (u32)wg_qat(2), (u32)n, (u32)(n >> 32),
+      sw | rows << 16, i | r << 8, out + (u64)(y + r) * w + x, w);
+    gpu_done(&gpu_req);
+  }
 }
 
 // The bang cube_run hands the GPU: its task alone on the host's ring 0. A
@@ -2557,11 +2716,14 @@ static void gpu_pass(u32 f) {
     a32_store_rel(a32_at(H, H_ROOT_DONE), 2);
     return;
   }
+  // One generation of kept Images at a time: while the host holds one,
+  // this bang's image starts past them and it keeps nothing of its own.
+  bool   keep = gpu_owed == 0;
   s->src     = H;
   s->src_at  = 0;
   s->src_len = ~0ull >> 1;
-  s->dst_at  = GPU_IMG;
-  s->top     = GPU_IMG;
+  s->dst_at  = keep ? GPU_IMG : gpu_live;
+  s->top     = s->dst_at;
   s->e       = e;
   Loc tl = seam_alloc(s, cls_fit(ar + 2));
   for (u32 j = 0; j < ar; j += 1) {
@@ -2577,6 +2739,7 @@ static void gpu_pass(u32 f) {
   gpu_head[H_BUMP]  = (s->top - HEAP_OFF + PAGE_LEN - 1) >> PAGE_BITS;
   gpu_head[H_CAP]   = (gpu_words - HEAP_OFF) >> PAGE_BITS;
   gpu_head[WG_NOUT] = 1;
+  gpu_head[WG_KEEP] = keep;
   if (gpu_head[H_BUMP] >= gpu_head[H_CAP]) {
     err_post(H, ERR_HEAP);
   }
@@ -2584,8 +2747,8 @@ static void gpu_pass(u32 f) {
   *q = (GpuReq){ 0 };
   q->put[0] = (GpuPut){ 0, (u32)(uintptr_t)gpu_head, GPU_HEAD };
   q->put[1] = (GpuPut){ STAT_OFF, (u32)(uintptr_t)(H + STAT_OFF), STAT_LEN };
-  q->put[2] = (GpuPut){ GPU_IMG, (u32)(uintptr_t)s->dst,
-    (u32)(s->top - GPU_IMG) };
+  q->put[2] = (GpuPut){ (u32)s->dst_at, (u32)(uintptr_t)s->dst,
+    (u32)(s->top - s->dst_at) };
   q->put[3] = (GpuPut){ (u32)wg_qat(1), (u32)(uintptr_t)&task, 1 };
   q->zero_at    = ALC_OFF;
   q->zero_words = CUBE * 2 * ALC_WORDS;
@@ -2605,16 +2768,10 @@ static void gpu_pass(u32 f) {
   u64 len = (u32)gpu_head[WG_PTOP];
   Loc r0  = (u32)gpu_head[WG_PR0];
   if (len > 0) {
-    if (len > gpu_arena_len) {
-      gpu_arena_len = len;
-      gpu_arena     = seam_grow(gpu_arena, len * 8);
-    }
-    *q = (GpuReq){ 0 };
-    q->put[0] = (GpuPut){ (u32)r0, (u32)(uintptr_t)gpu_arena, (u32)len };
-    gpu_ask(q, false);
+    gpu_read(r0, len);
   }
   Seam out = { gpu_arena, r0, len, H, 0, 0, 0, e, s->job, 0,
-    s->job_cap, s->key, s->val, 0, s->key_cap };
+    s->job_cap, s->key, s->val, 0, s->key_cap, keep };
   for (u32 j = 0; j + 1 < done; j += 1) {
     seam_job(&out, gpu_head[H_ROOT_WORD + j], H_ROOT_WORD + j);
   }
@@ -2624,6 +2781,9 @@ static void gpu_pass(u32 f) {
   s->key     = out.key;
   s->val     = out.val;
   s->key_cap = out.key_cap;
+  if (keep) {
+    gpu_live = r0;
+  }
   a32_store_rel(a32_at(H, H_ROOT_DONE), done);
 }
 `;

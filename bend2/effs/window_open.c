@@ -371,6 +371,12 @@ static void window_host_at(Corpus H, Term t, u32 i, u32 x, u32 y, u32 w,
   if (x >= w || y >= h) {
     return;
   }
+#ifdef BEND_WEBGPU
+  if (gpu_far(t) != 0) {
+    gpu_window(t, i, x, y, w, h, out);
+    return;
+  }
+#endif
   if (term_tag(t) == TAG_CTR && i > 0) {
     Loc l = term_rfc(t) ? H[term_loc(t)] >> 24 : term_loc(t);
     u32 s = 1u << (i - 1);
