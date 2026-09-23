@@ -2183,6 +2183,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
   var end = function(v, why) {
     if (why) {
       console.warn("bend: the ! runs on the cores: " + why);
+      Module.bendCores = why;
     }
     Atomics.store(HEAP32, q >> 2, v);
     Atomics.notify(HEAP32, q >> 2);

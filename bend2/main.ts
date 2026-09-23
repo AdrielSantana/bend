@@ -50,8 +50,9 @@ Read the guide (\`bend guide\`) before writing Bend code.
 `;
 
 // PAGE is the web page a build writes beside its .js and .wasm: the canvas a
-// Window draws on, a thread count to pick, its frames per second, a line per
-// print. ?gpu=off runs a ! on the cores.
+// Window draws on, where its ! runs (WebGPU, or ?gpu=off and a count of the
+// cores' threads, a reload since the runtime sizes its pool at start), its
+// frames per second, a line per print.
 const PAGE = `<!doctype html>
 <meta charset="utf-8">
 <title>NAME</title>
@@ -64,19 +65,27 @@ const PAGE = `<!doctype html>
   select { font: inherit; color: inherit; background: #222; border: 1px solid #444; }
 </style>
 <canvas id="bend"></canvas>
-<pre><select id="bend-threads"></select> threads, <span id="bend-rate"></span></pre>
+<pre><select id="bend-on"></select> <span id="bend-rate"></span></pre>
 <pre id="bend-out"></pre>
 <script>
   var cores   = navigator.hardwareConcurrency;
   var query   = new URLSearchParams(location.search);
   var threads = Math.min(Number(query.get("threads")) || cores, cores);
-  var select  = document.getElementById("bend-threads");
-  for (var i = 1; i <= cores; i += 1) {
-    select.appendChild(new Option(i, i));
+  var select  = document.getElementById("bend-on");
+  if (BANGS) {
+    select.appendChild(new Option("WebGPU", 0));
   }
-  select.value = threads;
+  for (var i = cores; i >= 1; i -= 1) {
+    select.appendChild(new Option(i + (i > 1 ? " CPU threads" : " CPU thread"), i));
+  }
+  select.value = BANGS && query.get("gpu") !== "off" ? 0 : threads;
   select.onchange = function() {
-    query.set("threads", select.value);
+    query.delete("gpu");
+    query.delete("threads");
+    if (select.value > 0) {
+      query.set("gpu", "off");
+      query.set("threads", select.value);
+    }
     location.search = query;
   };
   var say = function(text) {
@@ -96,8 +105,9 @@ const PAGE = `<!doctype html>
   var frames = 0;
   setInterval(function() {
     var n = Module.bendFrames | 0;
-    document.getElementById("bend-rate").textContent = (n - frames) + " fps"
-      + (Module.bendGpu ? ", ! on WebGPU" : "");
+    document.getElementById("bend-rate").textContent = [n > 0 ? n - frames
+      + " fps" : "", Module.bendCores ? "the ! on the cores: " + Module.bendCores
+      : ""].filter(Boolean).join(", ");
     frames = n;
   }, 1000);
 </script>
@@ -455,7 +465,8 @@ function cli_build_web(page: string, file: string): void {
   }
   const name = path.basename(base).replace(/[&<"]/g, (c) =>
     "&#" + c.charCodeAt(0) + ";");
-  fs.writeFileSync(page, PAGE.replaceAll("NAME", name));
+  fs.writeFileSync(page, PAGE.replaceAll("NAME", name)
+    .replaceAll("BANGS", String(gpu.length > 0)));
 }
 
 // cli_base prints the base library; with --types, its type declarations
