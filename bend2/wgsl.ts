@@ -2238,11 +2238,12 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
   };
   (async function() {
     // A laptop with two GPUs hands out its integrated one by default, the
-    // one that also draws the screen.
+    // one that also draws the screen; a software adapter (SwiftShader, let
+    // through by a flag) runs the rounds on the CPU, slower than the cores.
     var ad = navigator.gpu && await navigator.gpu.requestAdapter({
       powerPreference: "high-performance" });
-    if (!ad) {
-      return end(2, "no WebGPU adapter");
+    if (!ad || ad.info.isFallbackAdapter) {
+      return end(2, "no hardware WebGPU adapter");
     }
     var L = ad.limits;
     var dev = await ad.requestDevice({ requiredLimits: {
