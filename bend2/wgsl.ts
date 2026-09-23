@@ -2121,15 +2121,14 @@ fn c_pow(x: f32, y: f32) -> f32 {
 // Kernels
 // =======
 
-// The corpus, its mirror and the tables for both, sized (the page puts in
-// BEND_M_LEN, the corpus's words) so that no runtime length is divided out;
-// the plan writes the run's indirect arguments, a buffer of its own since a
-// dispatch cannot read one it binds for writing.
+// The corpus and its mirror, as long as the buffers bound (they grow,
+// gpu_grow; a length fixed in the shader read no faster), the tables for
+// both, and the run's indirect arguments the plan writes, a buffer of its
+// own since a dispatch cannot read one it binds for writing.
 const KERNELS = (tab: number) => String.raw`
-@group(0) @binding(0) var<storage, read_write> M:
-  array<atomic<u32>, BEND_M_LEN>;
+@group(0) @binding(0) var<storage, read_write> M: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read> TAB: array<u32, ${tab}>;
-@group(0) @binding(2) var<storage, read_write> P: array<u32, BEND_M_LEN>;
+@group(0) @binding(2) var<storage, read_write> P: array<u32>;
 @group(1) @binding(0) var<storage, read_write> A: array<u32, 6>;
 
 // The next round's groups, for run's tasks or pack's jobs.
@@ -2182,6 +2181,9 @@ const GLUE = String.raw`
 #include <emscripten/threading.h>
 ${WG_DEFS}
 #define GPU_IMG  (HEAP_OFF + PAGE_LEN)
+// A corpus starts with 512 MiB of heap over its fixed part (392 MiB): the
+// demos' frames reach 106 MiB, most runtime benches 304, and it grows.
+#define GPU_START (HEAP_OFF + (512ull << 17))
 #define GPU_HEAD (H_BANK + 3 * NCLS_ALL)
 
 typedef struct { u32 at; u32 ptr; u32 words; } GpuPut;
@@ -2196,6 +2198,9 @@ typedef struct {
   u32    back_words;
   u32    fid;
   u32    ord;
+  u32    heap;
+  u32    page;
+  u32    words;
 } GpuReq;
 
 typedef struct {
@@ -2218,6 +2223,8 @@ typedef struct {
 } Seam;
 
 static u32    gpu_words;
+static u32    gpu_most;
+static u64    gpu_peak;
 static GpuReq gpu_req;
 static Seam   gpu_seam;
 static u64    gpu_head[GPU_HEAD];
@@ -2230,7 +2237,7 @@ static u64    gpu_live;
 #define gpu_load(b)
 
 EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
-  GpuReq* q, u32 win, u32 pix), {
+  GpuReq* q, u32 win, u32 pix, u32 start), {
   var end = function(v, why) {
     if (why) {
       Module.bendOn = "the ! on the cores: " + why;
@@ -2259,36 +2266,55 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     });
     dev.lost.then(function(info) { G.bad = G.bad || "device lost: " + info.message; });
     var U = GPUBufferUsage;
-    var bytes = Math.floor(Math.min(L.maxBufferSize,
-      L.maxStorageBufferBindingSize, 2 ** 31) / 65536) * 65536;
-    for (;;) {
-      dev.pushErrorScope("out-of-memory");
-      G.M = dev.createBuffer({ size: bytes,
-        usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
-      G.P = dev.createBuffer({ size: bytes, usage: U.STORAGE | U.COPY_DST });
-      if (!await dev.popErrorScope()) {
-        break;
-      }
-      G.M.destroy();
-      G.P.destroy();
-      if (bytes <= 2 ** 29) {
-        return end(2, "no room for a corpus and its mirror");
-      }
-      bytes = Math.floor(bytes / 2 / 65536) * 65536;
-    }
-    // WebGPU zeroes a buffer at its first use: done here, while the shader
-    // compiles, since the first ! would otherwise pay ~100 ms for the
-    // corpora (Apple M5), whatever its size.
-    var enc = dev.createCommandEncoder();
-    enc.clearBuffer(G.M);
-    enc.clearBuffer(G.P);
-    dev.queue.submit([enc.finish()]);
+    var C = GPUShaderStage.COMPUTE;
     G.T = dev.createBuffer({ size: Math.max(n, 1) * 4,
       usage: U.STORAGE | U.COPY_DST });
     dev.queue.writeBuffer(G.T, 0, HEAPU32.slice(tab >> 2, (tab >> 2) + n));
     G.A = dev.createBuffer({ size: 32, usage: U.STORAGE | U.INDIRECT });
-    var mod = dev.createShaderModule({ code: UTF8ToString(src)
-      .replace(/BEND_M_LEN/g, bytes / 4 + "u") });
+    var b0 = dev.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: C, buffer: { type: "storage" } },
+      { binding: 1, visibility: C, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: C, buffer: { type: "storage" } }] });
+    var b1 = dev.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: C, buffer: { type: "storage" } }] });
+    // The corpus and its mirror, bytes each, the last ones' first keep bytes
+    // carried over and the rest zeroed now: WebGPU zeroes a buffer at its
+    // first use, and a ! would pay it (~100 ms for 4 GiB on an M5). False
+    // when the device has no room.
+    G.make = async function(bytes, keep) {
+      dev.pushErrorScope("out-of-memory");
+      var M = dev.createBuffer({ size: bytes,
+        usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+      var P = dev.createBuffer({ size: bytes,
+        usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+      if (await dev.popErrorScope()) {
+        M.destroy();
+        P.destroy();
+        return false;
+      }
+      var old = [G.M, G.P].filter(Boolean);
+      var enc = dev.createCommandEncoder();
+      enc.clearBuffer(M, keep);
+      enc.clearBuffer(P, keep);
+      old.forEach(function(b, i) {
+        enc.copyBufferToBuffer(b, 0, [M, P][i], 0, keep);
+      });
+      dev.queue.submit([enc.finish()]);
+      old.forEach(function(b) { b.destroy(); });
+      G.M = M;
+      G.P = P;
+      G.g0 = dev.createBindGroup({ layout: b0, entries: [
+        { binding: 0, resource: { buffer: M } },
+        { binding: 1, resource: { buffer: G.T } },
+        { binding: 2, resource: { buffer: P } }] });
+      return true;
+    };
+    G.most = Math.floor(Math.min(L.maxBufferSize,
+      L.maxStorageBufferBindingSize, 2 ** 31) / 65536) * 65536;
+    if (!await G.make(Math.min(Math.ceil(start / 8192) * 65536, G.most), 0)) {
+      return end(2, "no room for a corpus and its mirror");
+    }
+    var mod = dev.createShaderModule({ code: UTF8ToString(src) });
     var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
       return m.type === "error";
     });
@@ -2296,13 +2322,6 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
       return end(2, "the WGSL fails at " + bad[0].lineNum + ": "
         + bad[0].message);
     }
-    var C = GPUShaderStage.COMPUTE;
-    var b0 = dev.createBindGroupLayout({ entries: [
-      { binding: 0, visibility: C, buffer: { type: "storage" } },
-      { binding: 1, visibility: C, buffer: { type: "read-only-storage" } },
-      { binding: 2, visibility: C, buffer: { type: "storage" } }] });
-    var b1 = dev.createBindGroupLayout({ entries: [
-      { binding: 0, visibility: C, buffer: { type: "storage" } }] });
     var pipe = function(name, bs) {
       return dev.createComputePipelineAsync({ compute: { module: mod,
         entryPoint: name }, layout: dev.createPipelineLayout({
@@ -2312,10 +2331,6 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     G.run  = await pipe("run", [b0]);
     G.pack = await pipe("pack", [b0]);
     G.win  = await pipe("window", [b0]);
-    G.g0 = dev.createBindGroup({ layout: b0, entries: [
-      { binding: 0, resource: { buffer: G.M } },
-      { binding: 1, resource: { buffer: G.T } },
-      { binding: 2, resource: { buffer: G.P } }] });
     G.g1 = dev.createBindGroup({ layout: b1, entries: [
       { binding: 0, resource: { buffer: G.A } }] });
     // A band of a kept Image's square drawn into the third queue
@@ -2337,7 +2352,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
       ad.info.description].filter(Boolean).join(" ");
     await dev.queue.onSubmittedWorkDone();
     Module.bendGpu = G;
-    HEAPU32[(q >> 2) + 3] = bytes / 8;
+    HEAPU32[(q >> 2) + 3] = G.M.size / 8;
+    HEAPU32[(q >> 2) + 6] = G.most / 8;
     end(1);
   })().catch(function(e) { end(2, String(e)); });
 });
@@ -2347,7 +2363,9 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
 // after each submit until its stop word is set. A wait on the header costs
 // about a millisecond, and so do some twenty rounds past the stop. The
 // first four bangs of a function alternate the kids' order (WG_ORD), from
-// a slot a kid, and the later ones keep the order of the fastest.
+// a slot a kid, and the later ones keep the order of the fastest. A heap
+// past three quarters of its cap between two submits grows fourfold, the
+// whole corpus carried over (G.make), and the device's cap with it.
 EM_JS(void, webgpu_js_run, (GpuReq* q), {
   var G = Module.bendGpu;
   var w = function(k) { return HEAPU32[(q >> 2) + k]; };
@@ -2400,6 +2418,8 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
       HEAPU32.set(h, w(16) >> 2);
       var stop = h[2 * w(15)] !== 0;
       var used = h[2 * w(15) + 2] + 1;
+      var bump = h[0];
+      var cap = h[2];
       G.head.unmap();
       if (stop) {
         G.ks[w(18)] = Math.min(used, 256);
@@ -2407,12 +2427,28 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
         o.n += 1;
         return end(1);
       }
+      if (4 * bump > 3 * cap && G.M.size < G.most && await G.make(Math.min(G.most,
+        (w(20) + 4 * cap * w(21)) * 8), G.M.size)) {
+        HEAPU32[(q >> 2) + 22] = G.M.size / 8;
+        var c = new Uint32Array([(w(22) - w(20)) / w(21), 0]);
+        dq.writeBuffer(G.M, 8, c);
+        dq.writeBuffer(G.P, 8, c);
+      }
       enc = G.dev.createCommandEncoder();
     }
     end(2);
   })().catch(function(e) {
     console.error("bend: WebGPU: " + e);
     end(2);
+  });
+});
+
+// The corpus and its mirror grown to words each, their first keep words
+// carried over (G.make).
+EM_JS(void, webgpu_js_grow, (GpuReq* q, u32 words, u32 keep), {
+  Module.bendGpu.make(words * 8, keep * 8).then(function(ok) {
+    Atomics.store(HEAP32, q >> 2, ok ? 1 : 2);
+    Atomics.notify(HEAP32, q >> 2);
   });
 });
 
@@ -2505,11 +2541,30 @@ static void gpu_ask(GpuReq* q, bool run) {
 }
 
 static bool gpu_probe(void) {
-  MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5); },
-    GPU_SRC, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req, WG_WIN, (u32)wg_qat(2));
+  MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5, $6); },
+    GPU_SRC, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req, WG_WIN, (u32)wg_qat(2),
+    (u32)GPU_START);
   bool ok = gpu_wait(&gpu_req);
   gpu_words = gpu_req.put[0].words;
+  gpu_most  = gpu_req.put[1].words;
   return ok && gpu_words > GPU_IMG + CUBE * PAGE_LEN;
+}
+
+// The corpus grown to words, the device's limit at most, with what the
+// kept Images use carried over: false when it cannot grow.
+static bool gpu_grow(u64 words) {
+  words = words < gpu_most ? words : gpu_most;
+  if (words <= gpu_words) {
+    return false;
+  }
+  gpu_req = (GpuReq){ 0 };
+  MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_grow($0, $1, $2); }, &gpu_req,
+    (u32)words, (u32)gpu_live);
+  if (!gpu_wait(&gpu_req)) {
+    return false;
+  }
+  gpu_words = (u32)words;
+  return true;
 }
 
 static void* seam_grow(void* p, u64 bytes) {
@@ -2762,29 +2817,44 @@ static void gpu_pass(u32 f) {
   seam_sink(e, fid, a, ar);
   static u64 task;
   task = term_tsk(fid, tl);
-  memset(gpu_head, 0, sizeof gpu_head);
-  gpu_head[H_BUMP]  = (s->top - HEAP_OFF + PAGE_LEN - 1) >> PAGE_BITS;
-  gpu_head[H_CAP]   = (gpu_words - HEAP_OFF) >> PAGE_BITS;
-  gpu_head[WG_NOUT] = 1;
-  gpu_head[WG_KEEP] = keep;
-  if (gpu_head[H_BUMP] >= gpu_head[H_CAP]) {
-    err_post(H, ERR_HEAP);
-  }
+  // The corpus grows before a bang to twice the heap the highest bang
+  // reached, this one's image among them, and during one between submits
+  // (webgpu_js_run); a bang that runs out anyway, a burst within a submit,
+  // its lanes stopped by the error, runs again in the largest corpus the
+  // device allows (13 bangs run out on purpose, six programs, none ran on:
+  // 2026-09-23).
+  gpu_peak = s->top > gpu_peak ? s->top : gpu_peak;
+  gpu_grow(2 * gpu_peak - HEAP_OFF);
   GpuReq* q = &gpu_req;
-  *q = (GpuReq){ 0 };
-  q->put[0] = (GpuPut){ 0, (u32)(uintptr_t)gpu_head, GPU_HEAD };
-  q->put[1] = (GpuPut){ STAT_OFF, (u32)(uintptr_t)(H + STAT_OFF), STAT_LEN };
-  q->put[2] = (GpuPut){ (u32)s->dst_at, (u32)(uintptr_t)s->dst,
-    (u32)(s->top - s->dst_at) };
-  q->put[3] = (GpuPut){ (u32)wg_qat(1), (u32)(uintptr_t)&task, 1 };
-  q->zero_at    = ALC_OFF;
-  q->zero_words = CUBE * 2 * ALC_WORDS;
-  q->stop       = WG_STOP;
-  q->back       = (u32)(uintptr_t)gpu_head;
-  q->back_words = GPU_HEAD;
-  q->fid        = fid;
-  q->ord        = WG_ORD;
-  gpu_ask(q, true);
+  do {
+    memset(gpu_head, 0, sizeof gpu_head);
+    gpu_head[H_BUMP]  = (s->top - HEAP_OFF + PAGE_LEN - 1) >> PAGE_BITS;
+    gpu_head[H_CAP]   = (gpu_words - HEAP_OFF) >> PAGE_BITS;
+    gpu_head[WG_NOUT] = 1;
+    gpu_head[WG_KEEP] = keep;
+    if (gpu_head[H_BUMP] >= gpu_head[H_CAP]) {
+      err_post(H, ERR_HEAP);
+    }
+    *q = (GpuReq){ 0 };
+    q->put[0] = (GpuPut){ 0, (u32)(uintptr_t)gpu_head, GPU_HEAD };
+    q->put[1] = (GpuPut){ STAT_OFF, (u32)(uintptr_t)(H + STAT_OFF),
+      STAT_LEN };
+    q->put[2] = (GpuPut){ (u32)s->dst_at, (u32)(uintptr_t)s->dst,
+      (u32)(s->top - s->dst_at) };
+    q->put[3] = (GpuPut){ (u32)wg_qat(1), (u32)(uintptr_t)&task, 1 };
+    q->zero_at    = ALC_OFF;
+    q->zero_words = CUBE * 2 * ALC_WORDS;
+    q->stop       = WG_STOP;
+    q->back       = (u32)(uintptr_t)gpu_head;
+    q->back_words = GPU_HEAD;
+    q->fid        = fid;
+    q->ord        = WG_ORD;
+    q->heap       = HEAP_OFF;
+    q->page       = PAGE_LEN;
+    q->words      = gpu_words;
+    gpu_ask(q, true);
+    gpu_words = q->words;
+  } while ((u32)gpu_head[H_ERROR_CODE] == ERR_HEAP && gpu_grow(gpu_most));
   if ((u32)gpu_head[H_ERROR_CODE] != 0) {
     err_post(H, (u32)gpu_head[H_ERROR_CODE]);
   }
@@ -2794,6 +2864,7 @@ static void gpu_pass(u32 f) {
   }
   u64 len = (u32)gpu_head[WG_PTOP];
   Loc r0  = (u32)gpu_head[WG_PR0];
+  gpu_peak = r0 + len > gpu_peak ? r0 + len : gpu_peak;
   if (len > 0) {
     gpu_read(r0, len);
   }
