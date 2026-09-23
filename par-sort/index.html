@@ -12,7 +12,7 @@
 <canvas id="bend"></canvas>
 <pre><select id="bend-on"></select> <span id="bend-rate"></span></pre>
 <pre id="bend-out"></pre>
-<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Parallel sort</b>: a bitonic sort of a tree of 2<sup>16</sup> numbers in one <code>!</code>; prints sorted.<br>
+<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Parallel sort</b>: a bitonic sort of a tree of 2<sup>16</sup> numbers in one <code>!</code>; prints sorted, and the status line how long it ran: pick WebGPU or a count of threads to compare.<br>
 The selector under the picture runs the <code>!</code> on your GPU through WebGPU, or on a count of your CPU's threads.
 <a href="#" onclick="document.getElementById('bend').requestFullscreen(); return false">Fullscreen</a></p>
 <style>a { color: #8cf; }</style>
@@ -45,20 +45,26 @@ The selector under the picture runs the <code>!</code> on your GPU through WebGP
       ? ["--gpu", query.get("gpu")] : []),
     print: say,
     printErr: say,
-    onExit: function(code) { say("exit " + code); },
+    onExit: function(code) {
+      say("exit " + code);
+      rate();
+    },
   };
   if (!crossOriginIsolated) {
     say("no threads: the page needs the Cross-Origin-Opener-Policy: "
       + "same-origin and Cross-Origin-Embedder-Policy: require-corp headers");
   }
   var frames = 0;
-  setInterval(function() {
+  var rate = function() {
     var n = Module.bendFrames | 0;
     document.getElementById("bend-rate").textContent = [n > 0 ? n - frames
-      + " fps" : "", Module.bendCores ? "the ! on the cores: " + Module.bendCores
-      : ""].filter(Boolean).join(", ");
+      + " fps" : "", Module.bendRan === undefined ? "" : "ran "
+      + Module.bendRan.toFixed(1) + " ms", Module.bendCores
+      ? "the ! on the cores: " + Module.bendCores : ""].filter(Boolean)
+      .join(", ");
     frames = n;
-  }, 1000);
+  };
+  setInterval(rate, 1000);
 </script>
 <script src="../coi-serviceworker.js"></script>
 <script src="index.js"></script>
