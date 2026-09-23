@@ -558,10 +558,13 @@ function if_else(f: Fn, c: string, yes: () => void, no: () => void): void {
   emit(f, "}");
 }
 
+// A C name without its leading underscores (WGSL reserves __), one kept
+// before a digit (the C emitter's _11_0), counted by what it becomes.
 function name_new(f: Fn, base: string): string {
-  const k = (f.names.get(base) ?? 0) + 1;
-  f.names.set(base, k);
-  return base.replace(/^_+/, "") + "_" + k;
+  const stem = base.replace(/^_+/, "").replace(/^(?=\d)/, "_");
+  const k = (f.names.get(stem) ?? 0) + 1;
+  f.names.set(stem, k);
+  return stem + "_" + k;
 }
 
 // A value held in a `let`, so what runs after cannot change it.
