@@ -2246,7 +2246,9 @@ static void seam_run(Seam* s) {
   }
 }
 
-// The bang cube_run hands the GPU: its task alone on the host's ring 0.
+// The bang cube_run hands the GPU: its task alone on the host's ring 0. A
+// def that returns Unit gives Unit{} (fid_unit), so its bang frees its
+// arguments where they are: the device would free a copy of them.
 static void gpu_pass(u32 f) {
   Corpus H   = CORPUS;
   Env    e   = { H, ALC[0] };
@@ -2257,6 +2259,15 @@ static void gpu_pass(u32 f) {
   Fid    fid = (u32)term_aux(t);
   u32    ar  = fid_arity(fid);
   Loc    a   = term_loc(t);
+  if (fid_unit(fid)) {
+    for (u32 j = 0; j < ar; j += 1) {
+      term_sink(e, H[a + j]);
+    }
+    heap_free(e, cls_fit(ar + 2), a);
+    H[H_ROOT_WORD] = term_pak(CID_UNIT, 0);
+    a32_store_rel(a32_at(H, H_ROOT_DONE), 2);
+    return;
+  }
   s->src     = H;
   s->src_at  = 0;
   s->src_len = ~0ull >> 1;

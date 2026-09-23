@@ -1168,6 +1168,13 @@ function sig_def(cb: Carb, k: Bend.Name): Sig {
   });
 }
 
+// A def whose result is a Unit.
+function def_unit(cb: Carb, k: Bend.Name): boolean {
+  const tld = def_body(cb, k);
+  return tld?.$ === "Def" && ty_adt(cb.book, Bend.tele_fill(cb.book, tld.T,
+    Array(tld.n).fill(DUMMY), Bend.ctx_nil()))?.k === "Unit";
+}
+
 // A def's borrowed parameters (a box, not an Array, not owned), fixed a pass.
 function brw_of(cb: Carb, k: Bend.Name): boolean[] {
   return memo(BRWS, k, () => {
@@ -2917,19 +2924,29 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     defs.push(`CONSTV u8 ${nm}[] = { ${vals.join(", ")} };`);
   };
   table("FID_ARITY_T", entries.map((s) => s.params.length));
-  // A segment may fork (or bang) when it, or one it reaches, does; a
-  // closure apply reaches every closure.
-  const forky = new Set(fl.segs.filter((s) => s.fork).map((s) => s.fid));
-  for (let n = -1; n !== forky.size;) {
-    n = forky.size;
-    for (const s of [...fl.segs, { fid: "FID_CLO_APPLY", refs: fl.clos }]) {
-      if (!forky.has(s.fid) && [...s.refs].some((r) => forky.has(r))) {
-        forky.add(s.fid);
+  // The segments that are, or reach, one of the seed's; a closure apply
+  // reaches every closure.
+  const reach = (seed: (s: Seg) => boolean): Set<string> => {
+    const got = new Set(fl.segs.filter(seed).map((s) => s.fid));
+    for (let n = -1; n !== got.size;) {
+      n = got.size;
+      for (const s of [...fl.segs, { fid: "FID_CLO_APPLY", refs: fl.clos }]) {
+        if (!got.has(s.fid) && [...s.refs].some((r) => got.has(r))) {
+          got.add(s.fid);
+        }
       }
     }
-  }
+    return got;
+  };
+  // A segment may fork (or bang) when it, or one it reaches, does. A def
+  // that returns Unit gives Unit{} whatever it is given, once it ends, and
+  // it ends when it reaches no @unsafe def.
+  const forky = reach((s) => s.fork === true);
+  const wild = reach((s) => (fl.book.tlds[s.def] as Def | undefined)?.u
+    === true);
   table("FID_FLAG_T", entries.map((s) => Number(fl.bangs.has(s.def))
-    | Number(!forky.has(s.fid)) << 1));
+    | Number(!forky.has(s.fid)) << 1
+    | Number(def_unit(fl, s.def) && !wild.has(s.fid)) << 2));
   table("FID_RESW_T", entries.map((s) =>
     s.frame === null ? 0 : s.params.length - s.frame.at.length));
   table("CID_ARITY_T", [...fl.cids.values()]);
@@ -3679,6 +3696,8 @@ static const char* CLI_HELP =
 #define fid_bangs(x) ((bool)(FID_FLAG_T[x] & 1))
 
 #define fid_nofk(x) ((bool)(FID_FLAG_T[x] & 2))
+
+#define fid_unit(x) ((bool)(FID_FLAG_T[x] & 4))
 
 #define fid_seqk(x) (fid_resw(x) != 0)
 
