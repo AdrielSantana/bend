@@ -147,12 +147,13 @@ const WG_DEFS = `
 // the next dispatch, a lane a task up to the lanes, 0 when the root is
 // done, an error was posted or nothing is queued. A lane runs its task, as
 // monk_step does, then takes the next one nobody took, and queues what
-// each leaves: a ready parent, a fork's kids. Tasks fork until there are
-// four for each lane, then run whole, so the lanes finish together. Every
-// handoff crosses a dispatch.
+// each leaves: a ready parent, a fork's kids. A fork's kids take adjacent
+// slots, so a SIMD group runs neighbours, whose rays read the same blocks:
+// with a slot a kid Bendcraft's frame took 2 to 3 times as long. Tasks fork
+// until there are four for each lane, then run whole, so the lanes finish
+// together. Every handoff crosses a dispatch.
 const ROUNDS = WG_DEFS + `
-static void wg_push(Corpus H, Term t) {
-  u32 at = a32_add(a32_at(H, WG_NOUT), 1);
+static void wg_push(Corpus H, Term t, u32 at) {
   if (at >= WG_QCAP) {
     err_post(H, ERR_RING);
     return;
@@ -188,14 +189,20 @@ static void wg_task(Corpus H, u32 i, Term t, u32 seq) {
   Loc loc = term_loc(r);
   u32 ar  = fid_arity((u32)term_aux(r));
   if (a32_load(a32_at(H, loc + ar + 1)) == 0) {
-    wg_push(H, r);
+    wg_push(H, r, a32_add(a32_at(H, WG_NOUT), 1));
     return;
   }
+  u32 n = 0;
+  for (u32 j = 0; j < ar; j += 1) {
+    n += term_tag(H[loc + j]) == TAG_TSK;
+  }
+  u32 at = a32_add(a32_at(H, WG_NOUT), n);
   for (u32 j = 0; j < ar; j += 1) {
     Term k = H[loc + j];
     if (term_tag(k) == TAG_TSK) {
       H[loc + j] = TERM_HOLE;
-      wg_push(H, k);
+      wg_push(H, k, at);
+      at += 1;
     }
   }
 }
