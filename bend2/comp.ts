@@ -5315,6 +5315,7 @@ static void gpu_pass(u32 f) {
 #define gpu_span()  0
 #define gpu_load(b)
 #define gpu_pass(f)
+#define gpu_root(t) 0
 
 #endif
 

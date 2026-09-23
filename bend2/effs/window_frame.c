@@ -347,17 +347,27 @@ static Term window_frame(Env e, intptr_t at, Term image) {
 typedef struct { u32 w; u32 h; u32* pix; u32 cap; u32* evs; u32 got; } BendWin;
 #endif
 
+// An Image a ! left on the device is drawn there (window_js_show); a
+// frame from the heap goes as the device's texture takes it, 0xRRGGBB,
+// or as a 2d canvas does, RGBA.
 static Term window_frame(Env e, intptr_t at, Term image) {
-  BendWin* win = (BendWin*)at;
+  BendWin* win  = (BendWin*)at;
+  Term     root = gpu_root(image);
+  u32      k    = window_k(win->w, win->h);
   io_sync();
-  window_host(e.mem, image, win->w, win->h, window_k(win->w, win->h), win->pix);
-  for (u32 i = 0; i < win->w * win->h; i += 1) {
-    u32 c = win->pix[i];
-    win->pix[i] = 0xFF000000 | c >> 16 | (c & 0xFF00) | c << 16 & 0xFF0000;
+  if (root == 0) {
+    window_host(e.mem, image, win->w, win->h, k, win->pix);
+  }
+  if (!io_gpu) {
+    for (u32 i = 0; i < win->w * win->h; i += 1) {
+      u32 c = win->pix[i];
+      win->pix[i] = 0xFF000000 | c >> 16 | (c & 0xFF00) | c << 16 & 0xFF0000;
+    }
   }
   a32_store(&win->got, 0);
-  MAIN_THREAD_ASYNC_EM_ASM({ window_js_show($0, $1, $2, $3, $4, $5); },
-    win->pix, win->w, win->h, win->evs, win->cap, &win->got);
+  MAIN_THREAD_ASYNC_EM_ASM({ window_js_show($0, $1, $2, $3, $4, $5, $6, $7,
+    $8); }, win->pix, win->w, win->h, win->evs, win->cap, &win->got,
+    (u32)root, (u32)(root >> 32), k);
   while (a32_load_acq(&win->got) == 0) {
     emscripten_futex_wait(&win->got, 0, 1000);
   }

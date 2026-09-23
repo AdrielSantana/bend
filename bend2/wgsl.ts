@@ -471,14 +471,15 @@ static u32 wg_packing(Corpus H) {
 
 // A kept Image's square, a lane a pixel, as the native window_dev draws
 // it: WG_WIN holds its node, then the band's width and rows, the square's
-// level and the band's first row; the pixels go to the third queue.
+// level and the band's first row; the pixels go to the third queue, a row
+// every 64 words, as a copy into a texture takes them.
 static void wg_window(Corpus H, u32 i) {
   u32 wh = a32_load(a32_at(H, WG_WIN + 1));
   u32 kr = a32_load(a32_at(H, WG_WIN + 1) + 1);
   u32 w  = wh & 0xFFFF;
   if (i < w * (wh >> 16)) {
-    ((DEV u32*)wg_q(H, 2))[i] = window_pix(H, H[WG_WIN], kr & 0xFF, i % w,
-      (kr >> 8) + i / w);
+    ((DEV u32*)wg_q(H, 2))[i / w * ((w + 63) & ~63u) + i % w] = window_pix(H,
+      H[WG_WIN], kr & 0xFF, i % w, (kr >> 8) + i / w);
   }
 }
 `;
@@ -2226,7 +2227,7 @@ static u64    gpu_live;
 #define gpu_load(b)
 
 EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
-  GpuReq* q), {
+  GpuReq* q, u32 win, u32 pix), {
   var end = function(v, why) {
     if (why) {
       console.warn("bend: the ! runs on the cores: " + why);
@@ -2303,6 +2304,21 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
       { binding: 2, resource: { buffer: G.P } }] });
     G.g1 = dev.createBindGroup({ layout: b1, entries: [
       { binding: 0, resource: { buffer: G.A } }] });
+    // A band of a kept Image's square drawn into the third queue
+    // (wg_window): its node, then its size and level, in four words.
+    G.band = function(lo, hi, a, b) {
+      var args = new Uint32Array([lo, hi, a, b]);
+      dev.queue.writeBuffer(G.M, win * 8, args);
+      dev.queue.writeBuffer(G.P, win * 8, args);
+      var enc = dev.createCommandEncoder();
+      var pass = enc.beginComputePass();
+      pass.setPipeline(G.win);
+      pass.setBindGroup(0, G.g0);
+      pass.dispatchWorkgroups(Math.ceil((a & 0xFFFF) * (a >>> 16) / 64));
+      pass.end();
+      return enc;
+    };
+    G.pix = pix * 8;
     Module.bendGpu = G;
     HEAPU32[(q >> 2) + 3] = bytes / 8;
     end(1);
@@ -2413,21 +2429,19 @@ EM_JS(void, webgpu_js_read, (GpuReq* q), {
   });
 });
 
-// A band of a kept Image's square drawn where it lives (wg_window) and its
-// rows read back into the frame, stride words apart.
-EM_JS(void, webgpu_js_window, (GpuReq* q, u32 win, u32 pix, u32 lo, u32 hi,
-  u32 a, u32 b, u32* out, u32 stride), {
+// A band of a kept Image's square drawn where it lives and its rows read
+// back into the frame, stride words apart.
+EM_JS(void, webgpu_js_window, (GpuReq* q, u32 lo, u32 hi, u32 a, u32 b,
+  u32* out, u32 stride), {
   var G = Module.bendGpu;
   var sw = (a & 0xFFFF) * 4;
-  var n = sw * (a >>> 16);
+  var pw = ((a & 0xFFFF) + 63 & ~63) * 4;
+  var n = pw * (a >>> 16);
   var end = function(v) {
     Atomics.store(HEAP32, q >> 2, v);
     Atomics.notify(HEAP32, q >> 2);
   };
   (async function() {
-    var args = new Uint32Array([lo, hi, a, b]);
-    G.dev.queue.writeBuffer(G.M, win * 8, args);
-    G.dev.queue.writeBuffer(G.P, win * 8, args);
     if (!G.rb || G.rb.size < n) {
       if (G.rb) {
         G.rb.destroy();
@@ -2435,18 +2449,13 @@ EM_JS(void, webgpu_js_window, (GpuReq* q, u32 win, u32 pix, u32 lo, u32 hi,
       G.rb = G.dev.createBuffer({ size: Math.max(n, 1 << 20),
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     }
-    var enc = G.dev.createCommandEncoder();
-    var pass = enc.beginComputePass();
-    pass.setPipeline(G.win);
-    pass.setBindGroup(0, G.g0);
-    pass.dispatchWorkgroups(Math.ceil(n / 256));
-    pass.end();
-    enc.copyBufferToBuffer(G.M, pix * 8, G.rb, 0, n);
+    var enc = G.band(lo, hi, a, b);
+    enc.copyBufferToBuffer(G.M, G.pix, G.rb, 0, n);
     G.dev.queue.submit([enc.finish()]);
     await G.rb.mapAsync(GPUMapMode.READ, 0, n);
     var m = new Uint8Array(G.rb.getMappedRange(0, n));
-    for (var j = 0; j < n; j += sw) {
-      HEAPU8.set(m.subarray(j, j + sw), out + j / sw * stride * 4);
+    for (var j = 0; j < n; j += pw) {
+      HEAPU8.set(m.subarray(j, j + sw), out + j / pw * stride * 4);
     }
     G.rb.unmap();
     end(G.bad ? 2 : 1);
@@ -2479,8 +2488,8 @@ static void gpu_ask(GpuReq* q, bool run) {
 }
 
 static bool gpu_probe(void) {
-  MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3); }, GPU_SRC,
-    GPU_TAB, sizeof GPU_TAB / 4, &gpu_req);
+  MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5); },
+    GPU_SRC, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req, WG_WIN, (u32)wg_qat(2));
   bool ok = gpu_wait(&gpu_req);
   gpu_words = gpu_req.put[0].words;
   return ok && gpu_words > GPU_IMG + CUBE * PAGE_LEN;
@@ -2673,26 +2682,27 @@ static void seam_sink(Env e, Fid fid, Loc a, u32 ar) {
   heap_free(e, cls_fit(ar + 2), a);
 }
 
-// A kept Image's node on the device, else 0.
-static Loc gpu_far(Term t) {
+// A kept Image's term on the device, else 0.
+static Term gpu_root(Term t) {
   Loc l = term_rfc(t) ? CORPUS[term_loc(t)] >> 24 : term_loc(t);
-  return term_tag(t) == TAG_CTR && l >= GPU_FAR ? l & ~GPU_FAR : 0;
+  return term_tag(t) == TAG_CTR && l >= GPU_FAR
+    ? (t & ~(RFC_BIT | LOC_MASK)) | (l & ~GPU_FAR) : 0;
 }
 
-// A kept Image's square at (x, y), of side 2^i and clipped to the w x h
-// frame, drawn where it lives, a band of rows a dispatch: only its pixels
-// come back (window_host_at's, on a page).
+// A kept Image's square at (x, y) in an Image the host built, of side 2^i
+// and clipped to the w x h frame, drawn where it lives, a band of rows a
+// dispatch: only its pixels come back (window_host_at's, on a page).
 static void gpu_window(Term t, u32 i, u32 x, u32 y, u32 w, u32 h, u32* out) {
-  Term n    = (t & ~(RFC_BIT | LOC_MASK)) | gpu_far(t);
+  Term n    = gpu_root(t);
   u32  sw   = (1u << i) < w - x ? 1u << i : w - x;
   u32  sh   = (1u << i) < h - y ? 1u << i : h - y;
-  u32  band = 65535 * 64 / sw;
+  u32  band = 65535 * 64 / ((sw + 63) & ~63u);
   for (u32 r = 0; r < sh; r += band) {
     u32 rows = band < sh - r ? band : sh - r;
     gpu_req = (GpuReq){ 0 };
-    MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_window($0, $1, $2, $3, $4, $5, $6,
-      $7, $8); }, &gpu_req, WG_WIN, (u32)wg_qat(2), (u32)n, (u32)(n >> 32),
-      sw | rows << 16, i | r << 8, out + (u64)(y + r) * w + x, w);
+    MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_window($0, $1, $2, $3, $4, $5,
+      $6); }, &gpu_req, (u32)n, (u32)(n >> 32), sw | rows << 16, i | r << 8,
+      out + (u64)(y + r) * w + x, w);
     gpu_done(&gpu_req);
   }
 }

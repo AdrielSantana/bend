@@ -241,12 +241,19 @@ typedef struct { u32 w; u32 h; u32* pix; u32 cap; u32* evs; u32 got; } BendWin;
 // program runs on a worker. Events are the Mac's five words, its key codes
 // (a character in lower case, a function key's private-use character,
 // 65536 + a modifier's key code) and buttons (0 left, 1 right, 2 middle).
-EM_JS(void, window_js_open, (const char* title, u32 w, u32 h), {
+EM_JS(void, window_js_open, (const char* title, u32 w, u32 h, bool gpu), {
   var c = document.getElementById("bend");
   c.width  = w;
   c.height = h;
-  Module.bendCtx = c.getContext("2d");
-  Module.bendImg = new ImageData(w, h);
+  if (gpu) {
+    Module.bendWg = c.getContext("webgpu");
+    Module.bendWg.configure({ device: Module.bendGpu.dev, format: "bgra8unorm",
+      alphaMode: "opaque",
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
+  } else {
+    Module.bendCtx = c.getContext("2d");
+    Module.bendImg = new ImageData(w, h);
+  }
   document.title = UTF8ToString(title);
   var evs = Module.bendEvs;
   if (!evs) {
@@ -302,11 +309,30 @@ EM_JS(void, window_js_open, (const char* title, u32 w, u32 h), {
 // next tick (a hidden tab has no ticks). A program a frame ahead of the
 // display waits for that tick, as the Mac's nextDrawable waits for a free
 // drawable, and no longer: a frame late for a tick does not wait for the
-// next one.
+// next one. With the ! on WebGPU the canvas is a texture on its device,
+// and an Image the ! left there (lo, hi) is drawn into it where it lives,
+// at level k, a band of rows a dispatch: its pixels never reach the host.
 EM_JS(void, window_js_show, (u32* pix, u32 w, u32 h, u32* evs, u32 cap,
-  u32* got), {
+  u32* got, u32 lo, u32 hi, u32 k), {
   var take = function() {
-    Module.bendImg.data.set(HEAPU8.subarray(pix, pix + w * h * 4));
+    var G = Module.bendGpu;
+    if (!Module.bendWg) {
+      Module.bendImg.data.set(HEAPU8.subarray(pix, pix + w * h * 4));
+    } else if (lo | hi) {
+      var tex = Module.bendWg.getCurrentTexture();
+      var band = Math.floor(65535 * 64 / (w + 63 & ~63));
+      for (var r = 0; r < h; r += band) {
+        var rows = Math.min(band, h - r);
+        var enc = G.band(lo, hi, w | rows << 16, k | r << 8);
+        enc.copyBufferToTexture({ buffer: G.M, offset: G.pix,
+          bytesPerRow: (w + 63 & ~63) * 4 }, { texture: tex, origin: [0, r] },
+          [w, rows]);
+        G.dev.queue.submit([enc.finish()]);
+      }
+    } else {
+      G.dev.queue.writeTexture({ texture: Module.bendWg.getCurrentTexture() },
+        HEAPU8.slice(pix, pix + w * h * 4), { bytesPerRow: w * 4 }, [w, h]);
+    }
     var q = Module.bendEvs;
     var n = Math.min(q.length / 5, cap);
     HEAPU32.set(q.splice(0, n * 5), evs >> 2);
@@ -314,7 +340,9 @@ EM_JS(void, window_js_show, (u32* pix, u32 w, u32 h, u32* evs, u32 cap,
     Atomics.notify(HEAP32, got >> 2);
     var show = Module.bendDue = function() {
       var next = Module.bendNext;
-      Module.bendCtx.putImageData(Module.bendImg, 0, 0);
+      if (Module.bendCtx) {
+        Module.bendCtx.putImageData(Module.bendImg, 0, 0);
+      }
       Module.bendFrames = (Module.bendFrames | 0) + 1;
       Module.bendDue = Module.bendNext = null;
       if (next) {
@@ -336,7 +364,8 @@ EM_JS(void, window_js_show, (u32* pix, u32 w, u32 h, u32* evs, u32 cap,
 
 static u32 window_make(const char* title, u32 w, u32 h, intptr_t* out,
   const char** why) {
-  MAIN_THREAD_EM_ASM({ window_js_open($0, $1, $2); }, title, w, h);
+  MAIN_THREAD_EM_ASM({ window_js_open($0, $1, $2, $3); }, title, w, h,
+    io_gpu);
   BendWin* win = io_mem(calloc(1, sizeof *win));
   win->w   = w;
   win->h   = h;
@@ -372,7 +401,7 @@ static void window_host_at(Corpus H, Term t, u32 i, u32 x, u32 y, u32 w,
     return;
   }
 #ifdef BEND_WEBGPU
-  if (gpu_far(t) != 0) {
+  if (gpu_root(t) != 0) {
     gpu_window(t, i, x, y, w, h, out);
     return;
   }
