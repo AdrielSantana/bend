@@ -304,24 +304,27 @@ static void wg_chunk(Corpus H, bool buf, Loc loc, Loc nd) {
   }
 }
 
-// A cell's reference at s, for d. The lane that claims the cell copies it:
-// the copy's word holds the content's term while it is walked, then the
-// cell's word, the count kept. A reference that finds the copy takes it,
-// and one that finds the cell claimed tries again a round later.
+// A cell's reference at s, for d. A max of WG_PEND claims the cell's high
+// word, and the lane that finds it unclaimed copies the cell: the copy's
+// word holds the content's term while it is walked, then the cell's word,
+// the count kept. A reference that finds the copy takes it (and puts it
+// back if its max hid it), and one that finds the cell claimed tries again
+// a round later.
 static void wg_cell(Corpus H, Loc s, Loc d, Loc r0, Loc end) {
   Term     t  = H[s];
   Loc      r  = term_loc(t);
   DEV u32* hi = a32_at(H, r) + 1;
   u32      v  = a32_load(hi);
-  while (v < WG_FWD && a32_cmpx(hi, v, WG_PEND) != v) {
-    v = a32_load(hi);
+  u32      o  = v < WG_FWD ? a32_max(hi, WG_PEND) : v;
+  if (o != v && o != WG_PEND) {
+    a32_store(hi, o);
   }
-  if (v == WG_PEND) {
+  if (o == WG_PEND) {
     wg_push(H, (s << 32) | d, a32_add(a32_at(H, WG_NOUT), 1));
     return;
   }
-  if (v >= WG_FWD) {
-    H[d] = (t & ~LOC_MASK) | (v & ~WG_FWD);
+  if (o >= WG_FWD) {
+    H[d] = (t & ~LOC_MASK) | (o & ~WG_FWD);
     return;
   }
   u32  lo = a32_load(a32_at(H, r));
@@ -421,16 +424,26 @@ static void wg_run(Corpus H, u32 i) {
   u32 n    = a32_load(a32_at(H, WG_NIN));
   u32 seq  = a32_load(a32_at(H, WG_SEQ));
   u32 side = a32_load(a32_at(H, WG_SIDE));
-  u32 pack = a32_load(a32_at(H, WG_PACK));
+  for (u32 j = i; j < n; j = a32_add(a32_at(H, WG_GRAB), 1)) {
+    wg_task(H, i, wg_q(H, side)[j], seq);
+  }
+}
+
+// The pack's rounds run in a kernel of their own: in the tasks' kernel the
+// pack's code made Slash Boss 3D's first bang allocate past the heap in its
+// eighth round, before any packing, on most runs.
+static void wg_packs(Corpus H, u32 i) {
+  u32 n    = a32_load(a32_at(H, WG_NIN));
+  u32 side = a32_load(a32_at(H, WG_SIDE));
   Loc r0   = H[WG_PR0];
   Loc end  = HEAP_OFF + ((Loc)a32_load(a32_at(H, H_CAP)) << PAGE_BITS);
   for (u32 j = i; j < n; j = a32_add(a32_at(H, WG_GRAB), 1)) {
-    if (pack != 0) {
-      wg_pack(H, wg_q(H, side)[j], r0, end);
-    } else {
-      wg_task(H, i, wg_q(H, side)[j], seq);
-    }
+    wg_pack(H, wg_q(H, side)[j], r0, end);
   }
+}
+
+static u32 wg_packing(Corpus H) {
+  return a32_load(a32_at(H, WG_PACK));
 }
 `;
 
@@ -1854,7 +1867,9 @@ function fn_emit(u: Unit, inst: string, d: N, ps: (Ptr | undefined)[])
 function device_of(ast: N): { code: string; tab: number[] } {
   const u = unit_new(ast);
   inst_of(u, "wg_plan", []);
+  inst_of(u, "wg_packing", []);
   inst_of(u, "wg_run", []);
+  inst_of(u, "wg_packs", []);
   const fns: string[] = [];
   while (u.todo.length > 0) {
     const [inst, d, ps] = u.todo.pop()!;
@@ -2074,18 +2089,29 @@ const KERNELS = (tab: number) => String.raw`
   array<atomic<u32>, BEND_M_LEN>;
 @group(0) @binding(1) var<storage, read> TAB: array<u32, ${tab}>;
 @group(0) @binding(2) var<storage, read_write> P: array<u32, BEND_M_LEN>;
-@group(1) @binding(0) var<storage, read_write> A: array<u32, 3>;
+@group(1) @binding(0) var<storage, read_write> A: array<u32, 6>;
 
+// The next round's groups, for run's tasks or pack's jobs.
 @compute @workgroup_size(1)
 fn plan() {
-  A[0] = c_wg_plan(0u);
+  let n = c_wg_plan(0u);
+  let k = c_wg_packing(0u) != 0u;
+  A[0] = select(n, 0u, k);
   A[1] = 1u;
   A[2] = 1u;
+  A[3] = select(0u, n, k);
+  A[4] = 1u;
+  A[5] = 1u;
 }
 
 @compute @workgroup_size(64)
 fn run(@builtin(global_invocation_id) g: vec3<u32>) {
   c_wg_run(0u, g.x);
+}
+
+@compute @workgroup_size(64)
+fn pack(@builtin(global_invocation_id) g: vec3<u32>) {
+  c_wg_packs(0u, g.x);
 }
 `;
 
@@ -2197,7 +2223,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     G.T = dev.createBuffer({ size: Math.max(n, 1) * 4,
       usage: U.STORAGE | U.COPY_DST });
     dev.queue.writeBuffer(G.T, 0, HEAPU32.slice(tab >> 2, (tab >> 2) + n));
-    G.A = dev.createBuffer({ size: 16, usage: U.STORAGE | U.INDIRECT });
+    G.A = dev.createBuffer({ size: 32, usage: U.STORAGE | U.INDIRECT });
     var mod = dev.createShaderModule({ code: UTF8ToString(src)
       .replace(/BEND_M_LEN/g, bytes / 4 + "u") });
     var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
@@ -2221,6 +2247,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     };
     G.plan = await pipe("plan", [b0, b1]);
     G.run  = await pipe("run", [b0]);
+    G.pack = await pipe("pack", [b0]);
     G.g0 = dev.createBindGroup({ layout: b0, entries: [
       { binding: 0, resource: { buffer: G.M } },
       { binding: 1, resource: { buffer: G.T } },
@@ -2279,6 +2306,9 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
         pass.setPipeline(G.run);
         pass.setBindGroup(0, G.g0);
         pass.dispatchWorkgroupsIndirect(G.A, 0);
+        pass.setPipeline(G.pack);
+        pass.setBindGroup(0, G.g0);
+        pass.dispatchWorkgroupsIndirect(G.A, 12);
       }
       pass.end();
       enc.copyBufferToBuffer(G.M, 0, G.head, 0, bw);
