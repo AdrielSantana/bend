@@ -14,7 +14,6 @@
   ul { list-style: none; padding: 0; margin: 20px 0; display: grid; gap: 10px; }
   li { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; }
   li b { color: #eee; }
-  .go { float: right; margin-left: 12px; white-space: nowrap; }
   code { color: #eee; }
 </style>
 <main>
@@ -27,23 +26,17 @@
     and CUDA, and here in the browser.
   </p>
   <p>
-    Each page's status line reports whether its <code>!</code> ran on WebGPU. Each also links to
-    the same page on the CPU cores (<code>?gpu=off</code>), for comparison.
+    A selector under each page's picture runs its <code>!</code> on WebGPU or on a count of your
+    CPU's threads, for comparison.
   </p>
   <ul>
-    <li><span class="go"><a href="bendcraft/">GPU</a> · <a href="bendcraft/?gpu=off">cores</a></span>
-      <b>Bendcraft</b>: an endless voxel world, a ray per pixel.
-      Try <a href="bendcraft/?size=1470x796x1">a 1470&times;796 frame</a>.</li>
-    <li><span class="go"><a href="bendcraft-bench/">GPU</a> · <a href="bendcraft-bench/?gpu=off">cores</a></span>
-      <b>Bendcraft's bench</b>: the render's <code>!</code> timed at six sizes, 512&times;512 to 1920&times;1080.</li>
-    <li><span class="go"><a href="fly/">GPU</a> · <a href="fly/?gpu=off">cores</a></span>
-      <b>Fly</b>: ray-marched spheres with hard shadows, a 1024&times;1024 frame from one <code>!</code>.</li>
-    <li><span class="go"><a href="slash-boss/">GPU</a> · <a href="slash-boss/?gpu=off">cores</a></span>
-      <b>Slash Boss 3D</b>: a boss fight over a small 3D library, its frame drawn by one <code>!</code>.</li>
-    <li><span class="go"><a href="par-sort/">GPU</a> · <a href="par-sort/?gpu=off">cores</a></span>
-      <b>Parallel sort</b>: a bitonic sort of 2<sup>16</sup> numbers; prints one line.</li>
-    <li><span class="go"><a href="par-sum/">GPU</a> · <a href="par-sum/?gpu=off">cores</a></span>
-      <b>Parallel sum</b>: a fork/join sum of 2<sup>16</sup> numbers; prints one line.</li>
+    <li><a href="bendcraft/"><b>Bendcraft</b></a>: an endless voxel world, a ray per pixel;
+      its window's size and the render's scale are picked on the page.</li>
+    <li><a href="bendcraft-bench/"><b>Bendcraft's bench</b></a>: the render's <code>!</code> timed at six sizes, 512&times;512 to 1920&times;1080.</li>
+    <li><a href="fly/"><b>Fly</b></a>: ray-marched spheres with hard shadows, a 1024&times;1024 frame from one <code>!</code>.</li>
+    <li><a href="slash-boss/"><b>Slash Boss 3D</b></a>: a boss fight over a small 3D library, its frame drawn by one <code>!</code>, with sound.</li>
+    <li><a href="par-sort/"><b>Parallel sort</b></a>: a bitonic sort of 2<sup>16</sup> numbers; prints one line.</li>
+    <li><a href="par-sum/"><b>Parallel sum</b></a>: a fork/join sum of 2<sup>16</sup> numbers; prints one line.</li>
   </ul>
   <p class="dim">
     Needs WebGPU (Chrome or Edge on the desktop, recent Safari) and SharedArrayBuffer.
