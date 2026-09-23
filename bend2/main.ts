@@ -110,8 +110,7 @@ const PAGE = `<!doctype html>
     var n = Module.bendFrames | 0;
     document.getElementById("bend-rate").textContent = [n > 0 ? n - frames
       + " fps" : "", Module.bendRan === undefined ? "" : "ran "
-      + Module.bendRan.toFixed(1) + " ms", Module.bendCores
-      ? "the ! on the cores: " + Module.bendCores : ""].filter(Boolean)
+      + Module.bendRan.toFixed(1) + " ms", Module.bendOn].filter(Boolean)
       .join(", ");
     frames = n;
   };

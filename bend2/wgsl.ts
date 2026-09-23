@@ -2230,8 +2230,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
   GpuReq* q, u32 win, u32 pix), {
   var end = function(v, why) {
     if (why) {
-      console.warn("bend: the ! runs on the cores: " + why);
-      Module.bendCores = why;
+      Module.bendOn = "the ! on the cores: " + why;
+      console.warn("bend: " + Module.bendOn);
     }
     Atomics.store(HEAP32, q >> 2, v);
     Atomics.notify(HEAP32, q >> 2);
@@ -2330,6 +2330,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
       return enc;
     };
     G.pix = pix * 8;
+    Module.bendOn = "the ! on " + [ad.info.vendor, ad.info.architecture,
+      ad.info.description].filter(Boolean).join(" ");
     await dev.queue.onSubmittedWorkDone();
     Module.bendGpu = G;
     HEAPU32[(q >> 2) + 3] = bytes / 8;
