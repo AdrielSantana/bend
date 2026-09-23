@@ -2269,6 +2269,13 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
       }
       bytes = Math.floor(bytes / 2 / 65536) * 65536;
     }
+    // WebGPU zeroes a buffer at its first use: done here, while the shader
+    // compiles, since the first ! would otherwise pay ~100 ms for the
+    // corpora (Apple M5), whatever its size.
+    var enc = dev.createCommandEncoder();
+    enc.clearBuffer(G.M);
+    enc.clearBuffer(G.P);
+    dev.queue.submit([enc.finish()]);
     G.T = dev.createBuffer({ size: Math.max(n, 1) * 4,
       usage: U.STORAGE | U.COPY_DST });
     dev.queue.writeBuffer(G.T, 0, HEAPU32.slice(tab >> 2, (tab >> 2) + n));
@@ -2319,6 +2326,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
       return enc;
     };
     G.pix = pix * 8;
+    await dev.queue.onSubmittedWorkDone();
     Module.bendGpu = G;
     HEAPU32[(q >> 2) + 3] = bytes / 8;
     end(1);
