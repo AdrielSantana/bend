@@ -12,6 +12,9 @@
 #import <AudioToolbox/AudioToolbox.h>
 #elif defined(__linux__)
 #include <alsa/asoundlib.h>
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#include <emscripten/threading.h>
 #endif
 
 typedef struct {
@@ -147,6 +150,115 @@ static void io_ring_free(IoRing* p) {
     }
     snd_pcm_close(p->unit);
   }
+  free(p);
+}
+
+#elif defined(__EMSCRIPTEN__)
+
+// An AudioWorklet drains the ring out of the page's shared memory. The
+// AudioContext lives on the main thread, so an open and a close run there and this worker waits for
+// their answer (1 done, 2 failed); a context starts suspended until the
+// page's first key or click.
+EM_JS(void, audio_js_open, (IoRing* p, _Atomic(u64)* read, float* pcm,
+  u32 frames, u32 rate, _Atomic(u32)* done), {
+  var ring = function() {
+    registerProcessor("bend-ring", class extends AudioWorkletProcessor {
+      constructor(o) {
+        super();
+        var m = o.processorOptions;
+        this.at  = new BigUint64Array(m.memory, m.read, 2);
+        this.pcm = new Float32Array(m.memory, m.pcm, m.frames * 2);
+      }
+      process(ins, outs) {
+        var l = outs[0][0];
+        var r = outs[0][1];
+        var k = this.pcm.length / 2;
+        var from = Atomics.load(this.at, 0);
+        var n = Math.min(Number(Atomics.load(this.at, 1) - from), l.length);
+        var at = Number(from % BigInt(k));
+        for (var i = 0; i < n; i += 1) {
+          var j = (at + i) % k * 2;
+          l[i] = this.pcm[j];
+          r[i] = this.pcm[j + 1];
+        }
+        l.fill(0, n);
+        r.fill(0, n);
+        Atomics.store(this.at, 0, from + BigInt(n));
+        return true;
+      }
+    });
+  };
+  var answer = function(v) {
+    Atomics.store(HEAP32, done >> 2, v);
+    Atomics.notify(HEAP32, done >> 2);
+  };
+  var ctx, url;
+  var go = function() {
+    if (ctx.state === "suspended") {
+      ctx.resume();
+    }
+  };
+  new Promise(function(ok) {
+    ctx = new AudioContext({ sampleRate: rate });
+    url = URL.createObjectURL(new Blob(["(" + ring + ")()"],
+      { type: "text/javascript" }));
+    ok(ctx.audioWorklet.addModule(url));
+  }).then(function() {
+    var node = new AudioWorkletNode(ctx, "bend-ring", { numberOfInputs: 0,
+      outputChannelCount: [2], processorOptions: { memory: HEAPU8.buffer,
+      read: read, pcm: pcm, frames: frames } });
+    node.connect(ctx.destination);
+    (Module.bendAudio = Module.bendAudio || new Map()).set(p, { ctx: ctx, go: go });
+    window.addEventListener("keydown", go);
+    window.addEventListener("pointerdown", go);
+    go();
+    answer(1);
+  }).catch(function(e) {
+    console.warn("bend: Audio.open: " + e);
+    if (ctx) {
+      ctx.close();
+    }
+    answer(2);
+  }).finally(function() {
+    URL.revokeObjectURL(url);
+  });
+});
+
+EM_JS(void, audio_js_close, (IoRing* p, _Atomic(u32)* done), {
+  var a = Module.bendAudio && Module.bendAudio.get(p);
+  var answer = function() {
+    Atomics.store(HEAP32, done >> 2, 1);
+    Atomics.notify(HEAP32, done >> 2);
+  };
+  if (!a) {
+    return answer();
+  }
+  Module.bendAudio.delete(p);
+  window.removeEventListener("keydown", a.go);
+  window.removeEventListener("pointerdown", a.go);
+  a.ctx.close().then(answer, answer);
+});
+
+static u32 io_ring_wait(_Atomic(u32)* done) {
+  while (atomic_load_explicit(done, memory_order_acquire) == 0) {
+    emscripten_futex_wait((void*)done, 0, 1000);
+  }
+  return atomic_load_explicit(done, memory_order_acquire);
+}
+
+static u32 io_ring_start(IoRing* p, u32 rate) {
+  _Atomic(u32) done = 0;
+  MAIN_THREAD_ASYNC_EM_ASM({ audio_js_open($0, $1, $2, $3, $4, $5); }, p,
+    &p->read, p->pcm, IO_RING, rate, &done);
+  return io_ring_wait(&done) == 1 ? 0 : ENODEV;
+}
+
+// The ring is freed once its context is closed: the worklet writes its
+// read count into it until then.
+static void io_ring_free(IoRing* p) {
+  _Atomic(u32) done = 0;
+  MAIN_THREAD_ASYNC_EM_ASM({ audio_js_close($0, $1); }, p, &done);
+  io_ring_wait(&done);
   free(p);
 }
 

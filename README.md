@@ -233,7 +233,7 @@ def add_zero(x):
   are planned.
 - The JavaScript target runs on one core and has no graphics or audio. The
   WebAssembly target (a page) runs on every core, its `!` on WebGPU, and has a
-  window, but no audio, files or sockets yet.
+  window and audio, but its files live in memory and it has no sockets yet.
 - Parallelism requires balanced calls. Flexible parallelism will be added later.
 - Sharing arrays with atomics across threads is experimental and needs `@unsafe`.
 - One GPU per program, one event loop, and no multi-machine execution yet.

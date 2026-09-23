@@ -513,10 +513,12 @@ must stay beside it: on macOS it needs Metal, on Linux CUDA 12 at
 with Audio `libasound2-dev`. A page (`-o file.html`, its .js and .wasm
 beside it) is the runtime as WebAssembly on a worker per core (a `!` runs on
 WebGPU, or on them where the browser has none or the address says
-`?gpu=off`) with a Window on its canvas; it needs Emscripten 3.1.35+ and a server
-sending `Cross-Origin-Opener-Policy: same-origin` and
-`Cross-Origin-Embedder-Policy: require-corp`, since threads need cross-origin
-isolation. `bend guide` prints this text, `bend base` prints
+`?gpu=off`) with a Window on its canvas and Audio through Web Audio (it starts
+at the page's first click or key, as browsers ask); the files it reads live in
+memory, packed in at build time by `EMCC_CFLAGS="--preload-file dir"`. It
+needs Emscripten 3.1.35+ and a server sending `Cross-Origin-Opener-Policy:
+same-origin` and `Cross-Origin-Embedder-Policy: require-corp`, since threads
+need cross-origin isolation. `bend guide` prints this text, `bend base` prints
 the Base library (`bend base Map` prints one name and everything under it), and
 `bend --help` lists the other commands.
 
