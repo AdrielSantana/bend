@@ -1,0 +1,122 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGPU compile test</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 16px; max-width: 900px; }
+  a { color: #2a7ab0; }
+  #now { font-weight: bold; }
+</style>
+<h1>WebGPU shader compile test</h1>
+<p>Each test only compiles shaders: nothing runs on the GPU. Open one test at a time, in order. If the browser freezes, the last line shown (and the tab's title) tells where.</p>
+<ul>
+  <li><a href="?t=chain">chain</a>: small shaders whose calls, once inlined, make 640 to 10 million lines</li>
+  <li><a href="?t=fly">fly</a>: Fly's shader (22.7 thousand lines inlined; it runs on Windows)</li>
+  <li><a href="?t=boss">boss</a>: Slash Boss's shader (2.1 million inlined)</li>
+  <li><a href="?t=craft">craft</a>: Bendcraft's shader (140 million inlined)</li>
+</ul>
+<div id="now"></div>
+<pre id="log"></pre>
+<script>
+const log = document.getElementById("log");
+const now = document.getElementById("now");
+const say = (s) => { log.textContent += s + "\n"; console.log("diag: " + s); };
+let cur = null, t0 = 0;
+setInterval(() => {
+  if (cur) {
+    const s = ((performance.now() - t0) / 1000).toFixed(0);
+    now.textContent = cur + ": " + s + " s";
+    document.title = cur + " " + s + " s";
+  }
+}, 500);
+async function step(name, f) {
+  cur = name;
+  t0 = performance.now();
+  now.textContent = name + " ...";
+  const r = await f();
+  const ms = performance.now() - t0;
+  cur = null;
+  now.textContent = "";
+  document.title = "WebGPU compile test";
+  say(name + ": " + (ms < 10000 ? ms.toFixed(1) + " ms" : (ms / 1000).toFixed(1) + " s"));
+  return r;
+}
+function chain(d) {
+  let s = "@group(0) @binding(0) var<storage, read_write> B: array<u32>;\n"
+    + "fn f0(x: u32) -> u32 {\n  var a = x * 1664525u + 1013904223u;\n"
+    + "  a = a ^ (a >> 13u);\n  a = a * 0x5bd1e995u;\n  a = a ^ (a >> 15u);\n"
+    + "  a = a + B[a & 1023u];\n  a = a ^ (a << 7u);\n  a = a * 2654435761u;\n"
+    + "  return a ^ (a >> 16u);\n}\n";
+  for (let i = 1; i <= d; i++) {
+    s += "fn f" + i + "(x: u32) -> u32 {\n";
+    for (let j = 0; j < 4; j++) {
+      s += "  let a" + j + " = f" + (i - 1) + "(x + " + j + "u);\n";
+    }
+    s += "  return a0 ^ a1 ^ a2 ^ a3;\n}\n";
+  }
+  return s + "@compute @workgroup_size(64)\nfn main(@builtin(global_invocation_id) g: vec3<u32>) {\n"
+    + "  B[g.x] = f" + d + "(g.x);\n}\n";
+}
+async function compile(dev, name, code, entries) {
+  const mod = await step(name + " module", async () => {
+    const m = dev.createShaderModule({ code });
+    const info = await m.getCompilationInfo();
+    const errs = info.messages.filter((x) => x.type === "error");
+    if (errs.length) {
+      say("  error: " + errs[0].message);
+    }
+    return m;
+  });
+  for (const e of entries) {
+    await step(name + " pipeline " + e, () => dev.createComputePipelineAsync({
+      layout: "auto", compute: { module: mod, entryPoint: e } }));
+  }
+}
+function load(src) {
+  return new Promise((ok, no) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = ok;
+    s.onerror = () => no(new Error("could not load " + src));
+    document.head.appendChild(s);
+  });
+}
+(async () => {
+  const t = new URLSearchParams(location.search).get("t");
+  say("user agent: " + navigator.userAgent);
+  if (!navigator.gpu) {
+    return say("no WebGPU in this browser");
+  }
+  const ad = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!ad) {
+    return say("no WebGPU adapter");
+  }
+  const i = ad.info, L = ad.limits;
+  say("adapter: " + [i.vendor, i.architecture, i.device, i.description].filter(Boolean).join(" / ")
+    + (i.isFallbackAdapter ? " (fallback)" : ""));
+  say("limits: maxBufferSize " + L.maxBufferSize + ", maxStorageBufferBindingSize "
+    + L.maxStorageBufferBindingSize);
+  if (!t) {
+    return;
+  }
+  const dev = await ad.requestDevice();
+  dev.addEventListener("uncapturederror", (ev) => say("device error: " + ev.error.message));
+  dev.lost.then((x) => say("device lost: " + x.message));
+  try {
+    if (t === "chain") {
+      for (let d = 3; d <= 10; d++) {
+        const lines = 10 * 4 ** d;
+        await compile(dev, "chain " + d + " (" + lines.toLocaleString("en") + " lines inlined)",
+          chain(d), ["main"]);
+      }
+    } else {
+      await step("load " + t + ".js", () => load(t + ".js"));
+      await compile(dev, t, window.SRC, ["plan", "window", "pack", "run"]);
+    }
+    say("done");
+  } catch (e) {
+    say("failed: " + e);
+  }
+})();
+</script>
