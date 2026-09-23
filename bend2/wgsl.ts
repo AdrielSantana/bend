@@ -329,7 +329,7 @@ static void wg_chunk(Corpus H, bool buf, Loc loc, Loc nd) {
 // word holds the content's term while it is walked, then the cell's word,
 // the count kept. A reference that finds the copy takes it (and puts it
 // back if its max hid it), and one that finds the cell claimed tries again
-// a round later.
+// a round later. A room at 0 is the heap run out, and word 0 the header's.
 static void wg_cell(Corpus H, Loc s, Loc d, Loc r0, Loc end) {
   Term     t  = H[s];
   Loc      r  = term_loc(t);
@@ -347,8 +347,11 @@ static void wg_cell(Corpus H, Loc s, Loc d, Loc r0, Loc end) {
     H[d] = (t & ~LOC_MASK) | (o & ~WG_FWD);
     return;
   }
+  Loc c = wg_room(H, 1, r0, end);
+  if (c == 0) {
+    return;
+  }
   u32  lo = a32_load(a32_at(H, r));
-  Loc  c  = wg_room(H, 1, r0, end);
   Term ct = (t & ~(RFC_BIT | LOC_MASK)) | ((Loc)v << 8) | (lo >> 24);
   a32_store(hi, WG_FWD | (u32)c);
   H[d] = (t & ~LOC_MASK) | c;
