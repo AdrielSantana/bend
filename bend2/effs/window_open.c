@@ -364,10 +364,34 @@ INLINE u32 window_k(u32 w, u32 h) {
   return m ? 32 - CLZ(m) : 0;
 }
 
-INLINE void window_host(Corpus H, Term root, u32 w, u32 h, u32 k, u32* out) {
-  for (u32 i = 0; i < w * h; i += 1) {
-    out[i] = window_pix(H, root, k, i % w, i / w);
+// A node's square of side 2^i at (x, y), clipped to the frame: each node is
+// read once, not once a pixel under it.
+static void window_host_at(Corpus H, Term t, u32 i, u32 x, u32 y, u32 w,
+  u32 h, u32* out) {
+  if (x >= w || y >= h) {
+    return;
   }
+  if (term_tag(t) == TAG_CTR && i > 0) {
+    Loc l = term_rfc(t) ? H[term_loc(t)] >> 24 : term_loc(t);
+    u32 s = 1u << (i - 1);
+    window_host_at(H, H[l + 0], i - 1, x, y, w, h, out);
+    window_host_at(H, H[l + 1], i - 1, x + s, y, w, h, out);
+    window_host_at(H, H[l + 2], i - 1, x, y + s, w, h, out);
+    window_host_at(H, H[l + 3], i - 1, x + s, y + s, w, h, out);
+    return;
+  }
+  u32 c  = window_pix(H, t, 0, 0, 0);
+  u32 xe = x + (1u << i) < w ? x + (1u << i) : w;
+  u32 ye = y + (1u << i) < h ? y + (1u << i) : h;
+  for (u32 j = y; j < ye; j += 1) {
+    for (u32 m = x; m < xe; m += 1) {
+      out[j * w + m] = c;
+    }
+  }
+}
+
+INLINE void window_host(Corpus H, Term root, u32 w, u32 h, u32 k, u32* out) {
+  window_host_at(H, root, k, 0, 0, w, h, out);
 }
 #endif
 
