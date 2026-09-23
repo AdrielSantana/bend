@@ -2237,7 +2237,7 @@ static u64    gpu_live;
 #define gpu_load(b)
 
 EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
-  GpuReq* q, u32 win, u32 pix, u32 start), {
+  GpuReq* q, u32 win, u32 pix, u32 least, u32 start), {
   var end = function(v, why) {
     if (why) {
       Module.bendOn = "the ! on the cores: " + why;
@@ -2309,9 +2309,12 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
         { binding: 2, resource: { buffer: P } }] });
       return true;
     };
+    // A corpus of least words holds the fixed part and a page a lane, no
+    // heap: under it the program would run the ! on the cores anyway.
     G.most = Math.floor(Math.min(L.maxBufferSize,
       L.maxStorageBufferBindingSize, 2 ** 31) / 65536) * 65536;
-    if (!await G.make(Math.min(Math.ceil(start / 8192) * 65536, G.most), 0)) {
+    if (G.most <= least * 8
+      || !await G.make(Math.min(Math.ceil(start / 8192) * 65536, G.most), 0)) {
       return end(2, "no room for a corpus and its mirror");
     }
     var mod = dev.createShaderModule({ code: UTF8ToString(src) });
@@ -2541,13 +2544,13 @@ static void gpu_ask(GpuReq* q, bool run) {
 }
 
 static bool gpu_probe(void) {
-  MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5, $6); },
-    GPU_SRC, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req, WG_WIN, (u32)wg_qat(2),
-    (u32)GPU_START);
+  MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5, $6,
+    $7); }, GPU_SRC, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req, WG_WIN,
+    (u32)wg_qat(2), (u32)(GPU_IMG + CUBE * PAGE_LEN), (u32)GPU_START);
   bool ok = gpu_wait(&gpu_req);
   gpu_words = gpu_req.put[0].words;
   gpu_most  = gpu_req.put[1].words;
-  return ok && gpu_words > GPU_IMG + CUBE * PAGE_LEN;
+  return ok;
 }
 
 // The corpus grown to words, the device's limit at most, with what the
