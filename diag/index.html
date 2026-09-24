@@ -9,7 +9,7 @@
   #now { font-weight: bold; }
 </style>
 <h1>WebGPU shader compile test</h1>
-<p>Each test only compiles shaders: nothing runs on the GPU. Open one test at a time, in order. If the browser freezes, the last line shown (and the tab's title) tells where.</p>
+<p>Each test only compiles shaders: nothing runs on the GPU. Outside Windows it compiles the run the page uses there, never the copy made for Direct3D, which Metal chokes on. Open one test at a time, in order. If the browser freezes, the last line shown (and the tab's title) tells where.</p>
 <ul>
   <li><a href="?t=chain">chain</a>: small shaders whose calls, once inlined, make 640 to 10 million lines</li>
   <li><a href="?t=fly">fly</a>: Fly's shader for Direct3D (23 thousand lines inlined)</li>
@@ -113,7 +113,8 @@ function load(src) {
       }
     } else {
       await step("load " + t + ".js", () => load(t + ".js"));
-      await compile(dev, t, window.SRC, ["plan", "window", "pack", "run_d3d"]);
+      await compile(dev, t, window.SRC, ["plan", "window", "pack",
+        /Windows/.test(navigator.userAgent) ? "run_d3d" : "run"]);
     }
     say("done");
   } catch (e) {
