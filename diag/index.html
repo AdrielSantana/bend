@@ -12,9 +12,10 @@
 <p>Each test only compiles shaders: nothing runs on the GPU. Open one test at a time, in order. If the browser freezes, the last line shown (and the tab's title) tells where.</p>
 <ul>
   <li><a href="?t=chain">chain</a>: small shaders whose calls, once inlined, make 640 to 10 million lines</li>
-  <li><a href="?t=fly">fly</a>: Fly's shader (22.7 thousand lines inlined; it runs on Windows)</li>
-  <li><a href="?t=boss">boss</a>: Slash Boss's shader (2.1 million inlined)</li>
-  <li><a href="?t=craft">craft</a>: Bendcraft's shader (140 million inlined)</li>
+  <li><a href="?t=fly">fly</a>: Fly's shader for Direct3D (23 thousand lines inlined)</li>
+  <li><a href="?t=boss">boss</a>: Slash Boss's shader for Direct3D (120 thousand inlined; the whole kernel was 2.3 million)</li>
+  <li><a href="?t=craft-typed">craft-typed</a>: Bendcraft's shader for Direct3D, with typed picks (184 thousand inlined)</li>
+  <li><a href="?t=craft">craft</a>: Bendcraft's shader for Direct3D, as the game is (304 thousand inlined; the whole kernel was 160 million)</li>
 </ul>
 <div id="now"></div>
 <pre id="log"></pre>
@@ -112,7 +113,7 @@ function load(src) {
       }
     } else {
       await step("load " + t + ".js", () => load(t + ".js"));
-      await compile(dev, t, window.SRC, ["plan", "window", "pack", "run"]);
+      await compile(dev, t, window.SRC, ["plan", "window", "pack", "run_d3d"]);
     }
     say("done");
   } catch (e) {
