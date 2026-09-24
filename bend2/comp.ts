@@ -5319,6 +5319,10 @@ static void gpu_pass(u32 f) {
 
 #endif
 
+#ifndef gpu_ready
+#define gpu_ready() true
+#endif
+
 // Cube
 // ====
 
@@ -5452,7 +5456,7 @@ OUTLINE Term corpus_eval(Corpus H, Term t) {
     }
     if ((u32)H[task_tail(r) + 1] == 0) {
       t = r;
-      if (io_gpu && fid_bangs((u32)term_aux(t))) {
+      if (io_gpu && gpu_ready() && fid_bangs((u32)term_aux(t))) {
         Loc  tl   = task_tail(t);
         Term cont = H[tl];
         u32  idx  = (u32)(H[tl + 1] >> 32) & 0xFFFF;

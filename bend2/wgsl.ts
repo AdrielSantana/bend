@@ -1966,15 +1966,20 @@ function fn_body(f: Fn, d: N): void {
   }
 }
 
-// The device program: every function the rounds reach and the records
-// they pass by value, Direct3D's run with its own copy of the functions it
-// reaches apart, and TAB's words.
+// The device program: the functions the plan, the packing and the window
+// reach and the records the rounds pass by value; run with the functions
+// only it reaches; Direct3D's run with its own copy of the functions it
+// reaches; and TAB's words. A page compiles the first with run, or on
+// Windows with Direct3D's.
 function device_of(ast: N, helpers: string)
-  : { code: string; d3d: string; tab: number[] } {
+  : { code: string; run: string; d3d: string; tab: number[] } {
   const u = unit_new(ast);
-  ["wg_plan", "wg_packing", "wg_run", "wg_packs", "wg_window"].forEach((f) =>
+  ["wg_plan", "wg_packing", "wg_packs", "wg_window"].forEach((f) =>
     inst_of(u, f, []));
   const fns = translated(u);
+  const shared = fns.size;
+  inst_of(u, "wg_run", []);
+  const all = [...translated(u, fns).values()];
   const v: Unit = { ...u, done: new Map(), todo: [], insts: new Map(),
     mach: new Set(), marked: new Set(), pre: "d_" };
   inst_of(v, "wg_run", []);
@@ -1983,7 +1988,10 @@ function device_of(ast: N, helpers: string)
     t.k === "rec" && !t.union && t.fs.length > 0).map((t) => t.k === "rec"
     ? `struct ${ty_wgsl(t)} { ${t.fs.map((x) => `f_${x.name}: `
       + ty_wgsl(x.t)).join(", ")} }\n` : "");
-  return { code: recs.join("") + [...fns.values()].join("\n"), d3d,
+  return { code: recs.join("") + all.slice(0, shared).join("\n"),
+    run: ["@compute @workgroup_size(64)",
+      "fn run(@builtin(global_invocation_id) g: vec3<u32>) {",
+      "  c_wg_run(0u, g.x);", "}", ...all.slice(shared)].join("\n"), d3d,
     tab: u.tab };
 }
 
@@ -2013,8 +2021,8 @@ function translated(u: Unit, fns = new Map<string, string>())
 // own (WGSL has no recursion, so each runs one call at a time), a call
 // sets its parameters and the state to come back to and jumps to its first
 // state, a return jumps back, and a pointer into the caller's locals is
-// copied in and out (machine). Metal and SPIR-V keep calls and never see
-// the copy: a shader text of its own, compiled on Windows only. Within 175
+// copied in and out (machine). Metal and SPIR-V keep calls and compile
+// run; Windows compiles the copy in its place (device_of). Within 175
 // thousand lines, DXC -O3 on a Mac (four times the pace above) compiles
 // Slash Boss's merges in 6.2 s and Bendcraft's machine in 21 s; within 50
 // thousand every function of Bendcraft was a state, 22 thousand calls into
@@ -2934,11 +2942,6 @@ fn plan() {
 }
 
 @compute @workgroup_size(64)
-fn run(@builtin(global_invocation_id) g: vec3<u32>) {
-  c_wg_run(0u, g.x);
-}
-
-@compute @workgroup_size(64)
 fn pack(@builtin(global_invocation_id) g: vec3<u32>) {
   c_wg_packs(0u, g.x);
 }
@@ -3015,6 +3018,7 @@ static u32    gpu_words;
 static u32    gpu_most;
 static u64    gpu_peak;
 static GpuReq gpu_req;
+static u32    gpu_compiled;
 static Seam   gpu_seam;
 static u64    gpu_head[GPU_HEAD];
 static u64*   gpu_arena;
@@ -3022,11 +3026,13 @@ static u64    gpu_arena_len;
 static u64    gpu_live;
 
 #define gpu_span()  (1ull << 30)
+#define gpu_ready() (a32_load_acq(&gpu_compiled) == 1)
 #define gpu_make(p) true
 #define gpu_load(b)
 
-EM_JS(void, webgpu_js_open, (const char* src, const char* src_d3d,
-  const u32* tab, u32 n, GpuReq* q, u32 win, u32 pix, u32 least, u32 start),
+EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
+  const char* src_d3d, const u32* tab, u32 n, GpuReq* q, u32* ready, u32 win,
+  u32 pix, u32 least, u32 start),
   {
   var end = function(v, why) {
     if (why) {
@@ -3109,29 +3115,6 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_d3d,
       || !await G.make(Math.min(Math.ceil(start / 8192) * 65536, G.most), 0)) {
       return end(2, "no room for a corpus and its mirror");
     }
-    // Direct3D takes seconds to a minute to compile a program's shader, so
-    // the status line says it is compiling and how long it took.
-    var t0 = performance.now();
-    Module.bendOn = "compiling the !'s shader";
-    var mod = dev.createShaderModule({ code: UTF8ToString(src)
-      + (d3d ? UTF8ToString(src_d3d) : "") });
-    var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
-      return m.type === "error";
-    });
-    if (bad.length > 0) {
-      return end(2, "the WGSL fails at " + bad[0].lineNum + ": "
-        + bad[0].message);
-    }
-    var pipe = function(name, bs) {
-      return dev.createComputePipelineAsync({ compute: { module: mod,
-        entryPoint: name }, layout: dev.createPipelineLayout({
-        bindGroupLayouts: bs }) });
-    };
-    G.plan = await pipe("plan", [b0, b1]);
-    G.run  = await pipe(d3d ? "run_d3d" : "run", [b0]);
-    G.pack = await pipe("pack", [b0]);
-    G.win  = await pipe("window", [b0]);
-    var took = ((performance.now() - t0) / 1000).toFixed(1);
     G.g1 = dev.createBindGroup({ layout: b1, entries: [
       { binding: 0, resource: { buffer: G.A } }] });
     // A band of a kept Image's square drawn into the third queue
@@ -3149,9 +3132,62 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_d3d,
       return enc;
     };
     G.pix = pix * 8;
-    Module.bendOn = "the ! on " + [ad.info.vendor, ad.info.architecture,
-      ad.info.description].filter(Boolean).join(" ") + ", compiled in " + took
-      + " s";
+    // Direct3D takes seconds to minutes to compile a program's shader, off
+    // the page's thread: the program waits a second for it, then starts
+    // with its ! on the cores, and the ! moves to the GPU when its pipelines
+    // are ready (gpu_ready), the status line counting the seconds.
+    var t0 = performance.now();
+    var secs = function() {
+      return ((performance.now() - t0) / 1000).toFixed(1) + " s";
+    };
+    var count = function() {
+      Module.bendOn = "the ! on the cores while its shader compiles: "
+        + secs();
+    };
+    count();
+    var tick = setInterval(count, 1000);
+    var set = function(v, on) {
+      clearInterval(tick);
+      Module.bendOn = on;
+      Atomics.store(HEAP32, ready >> 2, v);
+    };
+    var compiled = (async function() {
+      var mod = dev.createShaderModule({ code: UTF8ToString(src)
+        + UTF8ToString(d3d ? src_d3d : src_run) });
+      var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
+        return m.type === "error";
+      });
+      if (bad.length > 0) {
+        throw "the WGSL fails at " + bad[0].lineNum + ": " + bad[0].message;
+      }
+      var pipe = function(name, bs) {
+        return dev.createComputePipelineAsync({ compute: { module: mod,
+          entryPoint: name }, layout: dev.createPipelineLayout({
+          bindGroupLayouts: bs }) });
+      };
+      [G.plan, G.run, G.pack, G.win] = await Promise.all([
+        pipe("plan", [b0, b1]), pipe(d3d ? "run_d3d" : "run", [b0]),
+        pipe("pack", [b0]), pipe("window", [b0])]);
+    })().then(function() {
+      set(1, "the ! on " + [ad.info.vendor, ad.info.architecture,
+        ad.info.description].filter(Boolean).join(" ") + ", compiled in "
+        + secs());
+    }, function(e) {
+      set(2, "the ! on the cores: " + e);
+      console.warn("bend: " + Module.bendOn);
+      // A GPU process that dies compiling takes the device, and the frames
+      // the canvas shows with it: they go to a new device.
+      dev.lost.then(async function() {
+        G.dev = await (await navigator.gpu.requestAdapter()).requestDevice();
+        if (Module.bendWg) {
+          Module.bendWg.configure(Object.assign(
+            Module.bendWg.getConfiguration(), { device: G.dev }));
+        }
+      });
+    });
+    await Promise.race([compiled, new Promise(function(r) {
+      setTimeout(r, 1000);
+    })]);
     await dev.queue.onSubmittedWorkDone();
     Module.bendGpu = G;
     HEAPU32[(q >> 2) + 3] = G.M.size / 8;
@@ -3344,9 +3380,9 @@ static void gpu_ask(GpuReq* q, bool run) {
 
 static bool gpu_probe(void) {
   MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5, $6,
-    $7, $8); }, GPU_SRC, GPU_D3D, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req,
-    WG_WIN, (u32)wg_qat(2), (u32)(GPU_IMG + CUBE * PAGE_LEN),
-    (u32)GPU_START);
+    $7, $8, $9, $10); }, GPU_SRC, GPU_RUN, GPU_D3D, GPU_TAB,
+    sizeof GPU_TAB / 4, &gpu_req, &gpu_compiled, WG_WIN, (u32)wg_qat(2),
+    (u32)(GPU_IMG + CUBE * PAGE_LEN), (u32)GPU_START);
   bool ok = gpu_wait(&gpu_req);
   gpu_words = gpu_req.put[0].words;
   gpu_most  = gpu_req.put[1].words;
@@ -3699,12 +3735,13 @@ export function webgpu_page(c: string, dir: string, cc = "clang"): string {
   const helpers = HELPERS(!/\ba32_\w+\(blk_ptr\(/.test(c));
   const dev = device_of(ast_of(c, dir, cc), helpers);
   const tab = dev.tab.length > 0 ? dev.tab : [0];
-  const src = (KERNELS(tab.length) + helpers + "\n" + dev.code).split("\n");
+  const src = KERNELS(tab.length) + helpers + "\n" + dev.code;
   const glue = path.join(dir, "webgpu.c");
-  const str = (xs: string[]): string => xs.map((l) => JSON.stringify(l + "\n"))
-    .join("\n") + ";\n\n";
+  const str = (s: string): string => s.split("\n").map((l) =>
+    JSON.stringify(l + "\n")).join("\n") + ";\n\n";
   fs.writeFileSync(glue, "static const char GPU_SRC[] =\n" + str(src)
-    + "static const char GPU_D3D[] =\n" + str(dev.d3d.split("\n"))
+    + "static const char GPU_RUN[] =\n" + str(dev.run)
+    + "static const char GPU_D3D[] =\n" + str(dev.d3d)
     + "static const u32 GPU_TAB[] = { " + tab.join(", ") + " };\n" + GLUE);
   return glue;
 }
