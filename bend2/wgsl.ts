@@ -2016,7 +2016,7 @@ function translated(u: Unit, fns = new Map<string, string>())
 // copied in and out (machine). Metal and SPIR-V keep calls and never see
 // the copy: a shader text of its own, compiled on Windows only. Within 175
 // thousand lines, DXC -O3 on a Mac (four times the pace above) compiles
-// Slash Boss's merges in 6.4 s and Bendcraft's machine in 26 s; within 50
+// Slash Boss's merges in 6.2 s and Bendcraft's machine in 21 s; within 50
 // thousand every function of Bendcraft was a state, 22 thousand calls into
 // states a pixel where 175 thousand leaves a thousand.
 const BUDGET = 175000;
