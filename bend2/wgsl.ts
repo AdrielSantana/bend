@@ -3109,6 +3109,10 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_d3d,
       || !await G.make(Math.min(Math.ceil(start / 8192) * 65536, G.most), 0)) {
       return end(2, "no room for a corpus and its mirror");
     }
+    // Direct3D takes seconds to a minute to compile a program's shader, so
+    // the status line says it is compiling and how long it took.
+    var t0 = performance.now();
+    Module.bendOn = "compiling the !'s shader";
     var mod = dev.createShaderModule({ code: UTF8ToString(src)
       + (d3d ? UTF8ToString(src_d3d) : "") });
     var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
@@ -3127,6 +3131,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_d3d,
     G.run  = await pipe(d3d ? "run_d3d" : "run", [b0]);
     G.pack = await pipe("pack", [b0]);
     G.win  = await pipe("window", [b0]);
+    var took = ((performance.now() - t0) / 1000).toFixed(1);
     G.g1 = dev.createBindGroup({ layout: b1, entries: [
       { binding: 0, resource: { buffer: G.A } }] });
     // A band of a kept Image's square drawn into the third queue
@@ -3145,7 +3150,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_d3d,
     };
     G.pix = pix * 8;
     Module.bendOn = "the ! on " + [ad.info.vendor, ad.info.architecture,
-      ad.info.description].filter(Boolean).join(" ");
+      ad.info.description].filter(Boolean).join(" ") + ", compiled in " + took
+      + " s";
     await dev.queue.onSubmittedWorkDone();
     Module.bendGpu = G;
     HEAPU32[(q >> 2) + 3] = G.M.size / 8;
