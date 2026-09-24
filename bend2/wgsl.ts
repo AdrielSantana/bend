@@ -60,6 +60,16 @@ type Place =
 // A local: its WGSL name and C type.
 type Local = { name: string; t: Ty };
 
+// A statement as emitted: a line, or a block its opening line heads (an
+// if's with its else).
+type Stm = { line: string } | Blk;
+
+type Blk = { open: string; kids: Stm[]; alt?: Stm[] };
+
+// A call made from a state of Direct3D's (below): its callee, arguments,
+// and the local that takes what it returns.
+type Call = { inst: string; args: Val[]; t: Ty; dest: string };
+
 type Unit = {
   tds: Map<string, N>;
   recs: Map<string, N>;
@@ -72,19 +82,24 @@ type Unit = {
   tab: number[];
   done: Map<string, string>;
   todo: [string, N, Ptr[]][];
+  insts: Map<string, [N, Ptr[]]>;
   pure: Map<string, boolean>;
+  mach: Set<string>;
+  marked: Set<string>;
+  pre: string;
 };
 
 type Fn = {
   u: Unit;
-  out: string[];
-  ind: string;
+  out: Stm[];
   locals: Map<string, Local>;
   names: Map<string, number>;
   tmp: number;
   ret: Ty;
   name: string;
   alias: Map<string, Ptr>;
+  calls?: Call[];
+  to?: Set<string>;
 };
 
 // Constants
@@ -544,7 +559,8 @@ function unit_new(ast: N): Unit {
   const u: Unit = { tds: new Map(), recs: new Map(), tags: new Map(),
     locs: new Map(),
     fns: new Map(), globs: new Map(), tys: new Map(), tabs: new Map(),
-    tab: [], done: new Map(), todo: [], pure: new Map() };
+    tab: [], done: new Map(), todo: [], insts: new Map(), pure: new Map(),
+    mach: new Set(), marked: new Set(), pre: "c_" };
   const walk = (n: N): void => {
     const xs = n.inner ?? [];
     if (n.kind === "DeclStmt" || n.kind === "TranslationUnitDecl") {
@@ -802,30 +818,38 @@ function lit(t: Ty, v: bigint): Val {
 // ==
 
 function fn_new(u: Unit, name: string, ret: Ty): Fn {
-  return { u, out: [], ind: "  ", locals: new Map(), names: new Map(),
-    tmp: 0, ret, name, alias: new Map() };
+  return { u, out: [], locals: new Map(), names: new Map(), tmp: 0, ret, name,
+    alias: new Map() };
 }
 
 function emit(f: Fn, line: string): void {
-  f.out.push(f.ind + line);
+  f.out.push({ line });
 }
 
-function nest(f: Fn, open: string, go: () => void, close = "}"): void {
-  emit(f, open);
-  const ind = f.ind;
-  f.ind += "  ";
+function nest(f: Fn, open: string, go: () => void): void {
+  const s: Stm = { open, kids: [] };
+  const out = f.out;
+  out.push(s);
+  f.out = s.kids;
   go();
-  f.ind = ind;
-  emit(f, close);
+  f.out = out;
 }
 
 function if_else(f: Fn, c: string, yes: () => void, no: () => void): void {
-  nest(f, `if (${c}) {`, yes, "} else {");
-  const ind = f.ind;
-  f.ind += "  ";
+  const s: Stm = { open: `if (${c}) {`, kids: [], alt: [] };
+  const out = f.out;
+  out.push(s);
+  f.out = s.kids;
+  yes();
+  f.out = s.alt!;
   no();
-  f.ind = ind;
-  emit(f, "}");
+  f.out = out;
+}
+
+function render(xs: Stm[], ind: string, line = (l: string) => l): string[] {
+  return xs.flatMap((s) => "line" in s ? [ind + line(s.line)] : [ind + line(s.open),
+    ...render(s.kids, ind + "  ", line), ...s.alt ? [ind + "} else {",
+    ...render(s.alt, ind + "  ", line)] : [], ind + "}"]);
 }
 
 // A C name without its leading underscores (WGSL reserves __), one kept
@@ -852,7 +876,7 @@ function hold(f: Fn, v: Val): Val {
     return v;
   }
   const n = "t" + f.tmp++;
-  emit(f, `let ${n} = ${v.s};`);
+  emit(f, `let ${n}: ${v.b ? "bool" : ty_wgsl(v.t)} = ${v.s};`);
   return { ...v, s: n };
 }
 
@@ -1261,7 +1285,7 @@ function ex_bin(f: Fn, n: N, t: Ty): Val {
       return { s: `(${a} ${op} ${cond(ex(f, r))})`, t, b: true };
     }
     const v = "t" + f.tmp++;
-    emit(f, `var ${v} = ${a};`);
+    emit(f, `var ${v}: bool = ${a};`);
     nest(f, `if (${op === "&&" ? v : "!" + v}) {`, () => emit(f,
       `${v} = ${cond(ex(f, r))};`));
     return { s: v, t, b: true };
@@ -1460,6 +1484,11 @@ function needs(u: Unit, n: N): boolean {
   switch (n.kind) {
     case "CompoundAssignOperator":
       return true;
+    case "CallExpr":
+      if (u.marked.has(callee(n))) {
+        return true;
+      }
+      break;
     case "UnaryOperator":
       return n.opcode === "++" || n.opcode === "--" || needs(u, n.inner![0]);
     case "BinaryOperator":
@@ -1556,6 +1585,17 @@ function ex_call(f: Fn, n: N, t: Ty): Val {
   if (!f.u.fns.has(name)) {
     return die("a call to " + name + ", which the device does not hold");
   }
+  if (f.calls !== undefined) {
+    const got = f.u.done.get(name + "|" + shape(name, vs.map((v) => v.p))
+      .join(""));
+    if (got !== undefined && f.to!.has(got)) {
+      const dest = t.k === "void" ? "" : "t" + f.tmp++;
+      emit(f, "@call " + f.calls.length);
+      f.calls.push({ inst: got, args: vs, t, dest });
+      return t.k === "ptr" ? { s: "", t, p: { pk: "heap", ix: dest } }
+        : { s: dest, t };
+    }
+  }
   const inst = inst_of(f.u, name, vs.map((v) => v.p));
   const s = `${inst}(${vs.flatMap((v) => v.p === undefined ? [val(v)]
     : v.p.pk === "heap" ? [v.p.ix] : v.p.pk === "ref" ? [`&(${v.p.r})`]
@@ -1566,19 +1606,25 @@ function ex_call(f: Fn, n: N, t: Ty): Val {
 
 // A function's instance for where its pointer arguments point: a pointer
 // into the corpus is an index, one at a local a WGSL pointer.
-function inst_of(u: Unit, name: string, ps: (Ptr | undefined)[]): string {
-  const shape = ps.map((p) => p === undefined || p.pk === "heap" ? "h"
+// Its pointer arguments' shapes.
+function shape(name: string, ps: (Ptr | undefined)[]): string[] {
+  return ps.map((p) => p === undefined || p.pk === "heap" ? "h"
     : p.pk === "ref" ? "r" : p.pk === "arr" ? "a" + p.n
     : die("a table passed to " + name));
-  const key = name + "|" + shape.join("");
+}
+
+function inst_of(u: Unit, name: string, ps: (Ptr | undefined)[]): string {
+  const shape_ = shape(name, ps);
+  const key = name + "|" + shape_.join("");
   const hit = u.done.get(key);
   if (hit !== undefined) {
     return hit;
   }
-  const inst = "c_" + name + (shape.some((s) => s !== "h") ? "_"
-    + shape.join("") : "");
+  const inst = u.pre + name + (shape_.some((s) => s !== "h") ? "_"
+    + shape_.join("") : "");
   u.done.set(key, inst);
   u.todo.push([inst, u.fns.get(name)!, ps as Ptr[]]);
+  u.insts.set(inst, [u.fns.get(name)!, ps as Ptr[]]);
   return inst;
 }
 
@@ -1669,14 +1715,14 @@ function st_expr(f: Fn, n: N): void {
     case "CallExpr": {
       const v = ex(f, n);
       const s = v.p?.pk === "heap" ? v.p.ix : v.s;
-      if (/^(c_|atomic)\w*\(/.test(s)) {
+      if (new RegExp(`^(c_|${f.u.pre}|atomic)\\w*\\(`).test(s)) {
         emit(f, s + ";");
       }
       return;
     }
   }
   const v = ex(f, n);
-  if (/\bc_\w+\(|\batomic\w+\(/.test(v.s)) {
+  if (new RegExp(`\\b(c_|${f.u.pre})\\w+\\(|\\batomic\\w+\\(`).test(v.s)) {
     emit(f, `_ = ${val(v)};`);
   }
 }
@@ -1726,7 +1772,7 @@ function st_loop(f: Fn, init: N | undefined, c: N | undefined,
     }
     nest(f, "loop {", () => {
       if (k === null) {
-        emit(f, `if (!(${cond(ex(f, c!))})) { break; }`);
+        nest(f, `if (!(${cond(ex(f, c!))})) {`, () => emit(f, "break;"));
       }
       nest(f, "{", () => body(f, b));
       if (has(step)) {
@@ -1780,7 +1826,7 @@ function st_switch(f: Fn, n: N): void {
       }
     }));
     if (!groups.some((g) => g.labels.includes("default"))) {
-      emit(f, "default: {}");
+      nest(f, "default: {", () => {});
     }
   });
 }
@@ -1867,8 +1913,23 @@ function zero(t: Ty): string {
 
 function fn_emit(u: Unit, inst: string, d: N, ps: (Ptr | undefined)[])
   : string {
+  const f = fn_of(u, inst, d);
+  const { params, copies } = fn_params(f, d, ps);
+  fn_body(f, d);
+  return `fn ${inst}(${params.join(", ")})${f.ret.k === "void" ? ""
+    : " -> " + ty_wgsl(f.ret)} {\n${[...copies, ...render(f.out, "  ")]
+    .join("\n")}\n}\n`;
+}
+
+function fn_of(u: Unit, inst: string, d: N): Fn {
   const ft: string = d.type.qualType;
-  const f = fn_new(u, inst, ty_str(u, ft.slice(0, ft.indexOf("(")).trim()));
+  return fn_new(u, inst, ty_str(u, ft.slice(0, ft.indexOf("(")).trim()));
+}
+
+// Its parameters in WGSL, and the copies that make its values variables.
+function fn_params(f: Fn, d: N, ps: (Ptr | undefined)[])
+  : { params: string[]; copies: string[] } {
+  const u = f.u;
   const params: string[] = [];
   const copies: string[] = [];
   d.inner!.filter((x) => x.kind === "ParmVarDecl").forEach((p, i) => {
@@ -1892,35 +1953,763 @@ function fn_emit(u: Unit, inst: string, d: N, ps: (Ptr | undefined)[])
     params.push(`${name}_a: ${ty_wgsl(t)}`);
     copies.push(`  var ${name} = ${name}_a;`);
   });
+  return { params, copies };
+}
+
+// Its body, ending in a return when it returns a value.
+function fn_body(f: Fn, d: N): void {
   const b = d.inner!.find((x) => x.kind === "CompoundStmt")!;
   body(f, b);
   const last = (b.inner ?? []).filter((x) => x.kind !== "NullStmt").pop();
   if (f.ret.k !== "void" && last?.kind !== "ReturnStmt") {
     emit(f, `return ${zero(f.ret)};`);
   }
-  return `fn ${inst}(${params.join(", ")})${f.ret.k === "void" ? ""
-    : " -> " + ty_wgsl(f.ret)} {\n${[...copies, ...f.out].join("\n")}\n}\n`;
 }
 
 // The device program: every function the rounds reach and the records
-// they pass by value, and TAB's words.
-function device_of(ast: N): { code: string; tab: number[] } {
+// they pass by value, Direct3D's run with its own copy of the functions it
+// reaches apart, and TAB's words.
+function device_of(ast: N, helpers: string)
+  : { code: string; d3d: string; tab: number[] } {
   const u = unit_new(ast);
-  inst_of(u, "wg_plan", []);
-  inst_of(u, "wg_packing", []);
-  inst_of(u, "wg_run", []);
-  inst_of(u, "wg_packs", []);
-  inst_of(u, "wg_window", []);
-  const fns: string[] = [];
-  while (u.todo.length > 0) {
-    const [inst, d, ps] = u.todo.pop()!;
-    fns.push(fn_emit(u, inst, d, ps));
-  }
+  ["wg_plan", "wg_packing", "wg_run", "wg_packs", "wg_window"].forEach((f) =>
+    inst_of(u, f, []));
+  const fns = translated(u);
+  const v: Unit = { ...u, done: new Map(), todo: [], insts: new Map(),
+    mach: new Set(), marked: new Set(), pre: "d_" };
+  inst_of(v, "wg_run", []);
+  const d3d = run_d3d(v, helpers, translated(v));
   const recs = [...u.recs.keys()].map((id) => ty_rec(u, id)).filter((t) =>
     t.k === "rec" && !t.union && t.fs.length > 0).map((t) => t.k === "rec"
     ? `struct ${ty_wgsl(t)} { ${t.fs.map((x) => `f_${x.name}: `
       + ty_wgsl(x.t)).join(", ")} }\n` : "");
-  return { code: recs.join("") + fns.join("\n"), tab: u.tab };
+  return { code: recs.join("") + [...fns.values()].join("\n"), d3d,
+    tab: u.tab };
+}
+
+// Its functions translated, by instance.
+function translated(u: Unit, fns = new Map<string, string>())
+  : Map<string, string> {
+  while (u.todo.length > 0) {
+    const [inst, d, ps] = u.todo.pop()!;
+    fns.set(inst, fn_emit(u, inst, d, ps));
+  }
+  return fns;
+}
+
+// Direct3D
+// ========
+
+// Direct3D's compilers (DXC, FXC) inline every call, and compile about
+// 0.1 ms a line of the result (Chrome on Windows, an RTX 3050): the spins
+// the Bend compiler fuses call each other from many places, and Bendcraft's
+// run, 21 thousand lines of WGSL, is 160 million inlined. run_d3d runs a
+// copy of wg_run's functions (d_) made to inline within BUDGET lines. First
+// a function calls a callee it calls twice or more from one place: its body
+// becomes states of a loop of its own, and a call sets the callee's
+// arguments and the state to come back to and jumps to the state that calls
+// it (merges). Then, if still past BUDGET, the functions that blow it up
+// run once, as states of one loop: their locals live in frames of their
+// own (WGSL has no recursion, so each runs one call at a time), a call
+// sets its parameters and the state to come back to and jumps to its first
+// state, a return jumps back, and a pointer into the caller's locals is
+// copied in and out (machine). Metal and SPIR-V keep calls and never see
+// the copy: a shader text of its own, compiled on Windows only. Within 175
+// thousand lines, DXC -O3 on a Mac (four times the pace above) compiles
+// Slash Boss's merges in 6.4 s and Bendcraft's machine in 26 s; within 50
+// thousand every function of Bendcraft was a state, 22 thousand calls into
+// states a pixel where 175 thousand leaves a thousand.
+const BUDGET = 175000;
+const CALL = 6;
+const BASE = "        ";
+
+// A function of run_d3d: its variables' prefix, first state, parameters,
+// statements with its calls, and variables with their WGSL types.
+type Mfn = { pre: string; entry: number; params: MPar[]; ret: Ty;
+  body: Stm[]; calls: Call[]; vars: Map<string, string> };
+
+type MPar = { name: string; t: string; k: "val" | "ref" | "arr" };
+
+type St = { id: number; lines: string[] };
+
+// Where a state's code goes on: the state, the indent, and the switches it
+// is inside there (whose break is its own).
+type Cur = { st: St; ind: string; nat: number[] };
+
+// Where a break or continue lands: its switch or loop, and the state after
+// it, made when first needed; nat once a break stayed in the switch's state.
+type Tgt = { id: number; st: () => number; nat?: boolean };
+
+type Cx = { brk?: Tgt; cnt?: Tgt };
+
+// A callee called from one place: its state, the variables of its
+// arguments and of what it returns, and of the state to come back to.
+type Nat = { st: St; args: string[]; res: string; k: string };
+
+// A loop of states: its functions (none when local, a merged function's
+// own), its callees called from one place and their variables, the
+// function being taken apart and its variables' renaming.
+type Mx = { u: Unit; fns: Map<string, Mfn>; sts: St[]; ids: number;
+  fn: Mfn; rn: (l: string) => string; hot: WeakMap<Stm, boolean>;
+  local: boolean; nats: Map<string, Nat>; vars: Map<string, string> };
+
+// Each function's lines once every call in it is inlined, and whom it
+// calls, a callee once a site: WGSL has no recursion, so the calls form a
+// DAG.
+function inlining(src: string): { size: (f: string, own?: boolean) => number;
+  calls: Map<string, string[]> } {
+  const body = new Map(src.split(/^(?=fn \w+\()/m).map((b): [string, string] =>
+    [/^fn (\w+)/.exec(b)?.[1] ?? "", b]));
+  const calls = new Map([...body].map(([f, b]): [string, string[]] => [f,
+    [...b.slice(b.indexOf("{")).matchAll(/\b(\w+)\(/g)].map((m) => m[1])
+      .filter((c) => c !== f && body.has(c))]));
+  const memo = new Map<string, number>();
+  const size = (f: string, own = false): number => {
+    if (own) {
+      return body.get(f)!.split("\n").length;
+    }
+    const n = memo.get(f) ?? calls.get(f)!.reduce((a, c) => a + size(c),
+      size(f, true));
+    memo.set(f, n);
+    return n;
+  };
+  return { size, calls };
+}
+
+// The callees each function calls from one place while wg_run inlines
+// past BUDGET lines: one at a time, of those a function calls twice or
+// more, the one that saves the most lines a call it merges, the largest.
+function merges(src: string, root: string, own: (f: string) => boolean)
+  : Map<string, Set<string>> {
+  const { size, calls } = inlining(src);
+  const order: string[] = [];
+  const n = new Map<string, Map<string, number>>();
+  const walk = (f: string): void => {
+    if (!n.has(f)) {
+      n.set(f, new Map());
+      calls.get(f)!.forEach((c) => {
+        walk(c);
+        n.get(f)!.set(c, (n.get(f)!.get(c) ?? 0) + 1);
+      });
+      order.push(f);
+    }
+  };
+  walk(root);
+  const out = new Map<string, Set<string>>();
+  for (;;) {
+    const big = new Map<string, number>();
+    order.forEach((f) => big.set(f, [...n.get(f)!].reduce((a, [c, k]) =>
+      a + big.get(c)! * (out.get(f)?.has(c) ? 1 : k), size(f, true))));
+    const all = order.flatMap((f) => [...n.get(f)!].filter(([c, k]) => k > 1
+      && own(c) && !out.get(f)?.has(c)).map(([c]) => [f, c]));
+    if (big.get(root)! <= BUDGET || all.length === 0) {
+      return out;
+    }
+    const [f, c] = all.reduce((a, b) => big.get(b[1])! > big.get(a[1])! ? b
+      : a);
+    out.set(f, new Set([...out.get(f) ?? [], c]));
+  }
+}
+
+// A function whose calls to `to` are each made from one place: its body
+// the states of a loop of its own.
+function fn_merged(u: Unit, inst: string, to: Set<string>): string {
+  const [d, ps] = u.insts.get(inst)!;
+  const f = fn_of(u, inst, d);
+  const { params, copies } = fn_params(f, d, ps);
+  const g = fn_marked(f, d, to, "", []);
+  const mx: Mx = { u, fns: new Map(), sts: [], ids: 0, fn: g, rn: (l) => l,
+    hot: new WeakMap(), local: true, nats: new Map(), vars: new Map() };
+  const e = part(mx, g.body, {}, { st: st_new(mx), ind: BASE, nat: [] });
+  if (e !== null && f.ret.k === "void") {
+    put(e, "return;");
+  }
+  return [`fn ${inst}(${params.join(", ")})${f.ret.k === "void" ? ""
+    : " -> " + ty_wgsl(f.ret)} {`, ...copies,
+    ...[...g.vars, ...mx.vars].map(([n, t]) => `  var ${n}: ${t};`),
+    "  var pc = 1u;",
+    "  loop {",
+    ...pick(mx.sts, "    "),
+    "  }",
+    "}", ""].join("\n");
+}
+
+// Its body with its calls to `to` marked, and its variables: its locals,
+// the calls' results, and the parameters given.
+function fn_marked(f: Fn, d: N, to: Set<string>, pre: string,
+  params: MPar[]): Mfn {
+  const u = f.u;
+  f.calls = [];
+  f.to = to;
+  u.marked = new Set([...to].map((i) => u.insts.get(i)![0].name));
+  fn_body(f, d);
+  u.marked = new Set();
+  const vars = new Map(params.flatMap((p): [string, string][] => p.k === "arr"
+    ? [[p.name, p.t], [p.name + "_o", "u32"]] : [[p.name, p.t]]));
+  const walk = (xs: Stm[]): void => xs.forEach((s) => {
+    if ("line" in s) {
+      const m = /^(?:var|let) (\w+): ([^=;]+?)(?: = .*)?;$/.exec(s.line);
+      if (m !== null) {
+        vars.set(m[1], m[2]);
+      }
+    } else {
+      walk([...s.kids, ...s.alt ?? []]);
+    }
+  });
+  walk(f.out);
+  f.calls.filter((c) => c.dest !== "").forEach((c) => vars.set(c.dest,
+    ty_wgsl(c.t)));
+  return { pre, entry: 0, params, ret: f.ret, body: f.out, calls: f.calls,
+    vars };
+}
+
+// The functions run_d3d runs as states: none while wg_run inlines within
+// BUDGET lines, else wg_run and, a few at a time, the ones that save the
+// most lines a function they add, a call into states costing CALL lines.
+// A caller of one is one too, since its own calls would inline it whole;
+// the helpers never are. Weighing a function by its copies once all is
+// inlined, as a guess at how often it runs, took 79 functions and 380
+// calls a pixel into states for Bendcraft within 150 thousand lines where
+// counting them took 67 and 164 (a CPU build's profile of a frame).
+function machine(src: string, root: string, own: (f: string) => boolean)
+  : string[] {
+  const { size, calls } = inlining(src);
+  const order: string[] = [];
+  const up = new Map<string, Set<string>>();
+  const walk = (f: string): void => {
+    if (!up.has(f)) {
+      up.set(f, new Set());
+      calls.get(f)!.forEach((c) => {
+        walk(c);
+        up.get(c)!.add(f);
+      });
+      order.push(f);
+    }
+  };
+  walk(root);
+  const total = (m: Set<string>): number => {
+    const cost = new Map<string, number>();
+    order.forEach((f) => cost.set(f, calls.get(f)!.reduce((a, c) =>
+      a + (m.has(c) ? CALL : cost.get(c)!), size(f, true))));
+    return [...m].reduce((a, f) => a + cost.get(f)!, 0);
+  };
+  const m = new Set(size(root) > BUDGET ? [root] : []);
+  let t = total(m);
+  while (t > BUDGET && order.some((f) => !m.has(f) && own(f))) {
+    let best = { rate: -Infinity, fs: new Set<string>(), t };
+    order.filter((f) => !m.has(f) && own(f)).forEach((f) => {
+      const fs = new Set<string>();
+      const go = (x: string): void => {
+        if (!m.has(x) && !fs.has(x)) {
+          fs.add(x);
+          up.get(x)!.forEach(go);
+        }
+      };
+      go(f);
+      const t2 = total(new Set([...m, ...fs]));
+      const rate = (t - t2) / fs.size;
+      if (rate > best.rate) {
+        best = { rate, fs, t: t2 };
+      }
+    });
+    best.fs.forEach((f) => m.add(f));
+    t = best.t;
+  }
+  return [...m];
+}
+
+// run_d3d, and the functions of Direct3D's copy, merged, with the machine's
+// frames.
+function run_d3d(u: Unit, helpers: string, fns: Map<string, string>)
+  : string {
+  const root = u.pre + "wg_run";
+  const own = (f: string): boolean => u.insts.has(f);
+  const src = (): string => helpers + [...fns.values()].join("\n");
+  merges(src(), root, own).forEach((to, f) => fns.set(f, fn_merged(u, f, to)));
+  translated(u, fns);
+  machine(src(), root, own).forEach((f) => u.mach.add(f));
+  const code = (decls: string[], run: string[]): string => [...fns.values(),
+    ...decls, "@compute @workgroup_size(64)",
+    "fn run_d3d(@builtin(global_invocation_id) g: vec3<u32>) {", ...run,
+    "}", ""].join("\n");
+  if (u.mach.size === 0) {
+    return code([], [`  ${root}(0u, g.x);`]);
+  }
+  const mx: Mx = { u, fns: new Map(), sts: [], ids: 0, fn: undefined!,
+    rn: (l) => l, hot: new WeakMap(), local: false, nats: new Map(),
+    vars: new Map() };
+  [...u.mach].forEach((f, i) => mx.fns.set(f, fn_mach(u, f, "m" + i + "_")));
+  translated(u, fns);
+  mx.fns.forEach((g) => g.entry = st_new(mx).id);
+  mx.fns.forEach((g) => {
+    mx.fn = g;
+    mx.rn = (l) => l.replace(/(?<![\w.])[A-Za-z_]\w*/g, (x) => g.vars.has(x)
+      ? g.pre + x : x);
+    const e = part(mx, g.body, {}, { st: mx.sts[g.entry - 1], ind: BASE,
+      nat: [] });
+    if (e !== null) {
+      go_to(e, g.pre + "ret");
+    }
+  });
+  const w = mx.fns.get(root)!;
+  const pin: [string, string][] = [[w.pre + w.params[0].name, "0u"],
+    [w.pre + w.params[1].name, "g.x"], [w.pre + "ret", "0u"]];
+  const fr = frames(mx, root, pin.map(([x]) => x));
+  return code(fr.decls, [...fr.locals,
+    ...pin.map(([x, v]) => `  ${fr.at(x)} = ${v};`),
+    `  var pc = ${w.entry}u;`,
+    "  loop {",
+    "    if (pc == 0u) {",
+    "      break;",
+    "    }",
+    ...pick(mx.sts, "    "),
+    "    pc = 0u;",
+    "  }"]);
+}
+
+// The machine's variables. One that two states use lives in a slot of a
+// private array of its type, indexed past NZ so that no compiler keeps it
+// in a register across the loop (DXC took 16 s over nbody's machine with a
+// variable a slot, 3.7 s with arrays); the rest are a state's locals. A
+// state loads the slots it reads before it sets them, and stores a slot
+// where it writes its variable: a store at each jump of all a state sets
+// wrote a callee's stale arguments over those of its sibling, whose slots
+// are the same. A function's slots come past those of every function that
+// calls it, so functions never running at once share theirs; the callees'
+// arguments come last. A state's locals are renamed to variables of their
+// type that all states share (DXC's mem2reg took half of 22 s over the
+// 9748 locals of Bendcraft's machine, whose states use 296 at most).
+function frames(mx: Mx, root: string, pin: string[])
+  : { decls: string[]; locals: string[]; at: (x: string) => string } {
+  const ty = new Map(mx.vars);
+  const owner = new Map<string, Mfn | null>([...mx.vars.keys()].map((x) =>
+    [x, null]));
+  mx.fns.forEach((g) => [...g.vars, ["ret", "u32"], ...g.ret.k === "void"
+    ? [] : [["res", ty_wgsl(g.ret)]]].forEach(([n, t]) => {
+    ty.set(g.pre + n, t);
+    owner.set(g.pre + n, g);
+  }));
+  const ids = (l: string): string[] => (l.match(/(?<![\w.])[A-Za-z_]\w*/g)
+    ?? []).filter((x) => ty.has(x));
+  const writes = (l: string): string[] => [/^\s*(\w+)(?:\[[^\]]*\]|\.\w+)* = /
+    .exec(l)?.[1], ...[...l.matchAll(/&\(?(\w+)/g)].map((m) => m[1])]
+    .filter((x): x is string => x !== undefined && ty.has(x));
+  // Each state's variables, and whether it sets one whole before all else,
+  // so that its slot needs no load.
+  const use = mx.sts.map((st) => {
+    const first = new Map<string, boolean>();
+    let out = false;
+    st.lines.forEach((l) => {
+      const w = /^(\s*)(\w+) = (.*);$/.exec(l);
+      const whole = w !== null && ty.has(w[2]) ? w[2] : undefined;
+      ids(whole !== undefined ? w![3] : l).forEach((x) => first.has(x)
+        || first.set(x, false));
+      if (whole !== undefined) {
+        first.has(whole) || first.set(whole, w![1] === BASE && !out);
+      }
+      out ||= /^\s*pc = /.test(l);
+    });
+    return first;
+  });
+  const states = new Map<string, number>();
+  use.forEach((first) => first.forEach((_, x) => states.set(x,
+    (states.get(x) ?? 0) + 1)));
+  const slotted = new Set([...pin.filter((x) => ty.has(x)), ...[...states]
+    .filter(([, n]) => n > 1).map(([x]) => x)]);
+  const kinds = new Map<string, number>();
+  const kind = (x: string): number => kinds.get(ty.get(x)!)
+    ?? (kinds.set(ty.get(x)!, kinds.size), kinds.size - 1);
+  const size = new Map<Mfn | null, number[]>();
+  const slot = new Map<string, [number, number]>();
+  slotted.forEach((x) => {
+    const k = kind(x);
+    const n = size.get(owner.get(x)!) ?? [];
+    slot.set(x, [k, n[k] ?? 0]);
+    n[k] = (n[k] ?? 0) + 1;
+    size.set(owner.get(x)!, n);
+  });
+  const order: Mfn[] = [];
+  const seen = new Set<Mfn>();
+  const walk = (g: Mfn): void => {
+    if (!seen.has(g)) {
+      seen.add(g);
+      g.calls.filter((c) => mx.fns.has(c.inst)).forEach((c) =>
+        walk(mx.fns.get(c.inst)!));
+      order.push(g);
+    }
+  };
+  walk(mx.fns.get(root)!);
+  const off = new Map<Mfn | null, number[]>();
+  const top: number[] = [];
+  order.reverse().forEach((g) => {
+    const o = off.get(g) ?? [];
+    off.set(g, o);
+    const end = [...kinds.values()].map((k) => (o[k] ?? 0)
+      + (size.get(g)?.[k] ?? 0));
+    end.forEach((v, k) => top[k] = Math.max(top[k] ?? 0, v));
+    g.calls.filter((c) => mx.fns.has(c.inst)).forEach((c) => {
+      const to = off.get(mx.fns.get(c.inst)!) ?? [];
+      end.forEach((v, k) => to[k] = Math.max(to[k] ?? 0, v));
+      off.set(mx.fns.get(c.inst)!, to);
+    });
+  });
+  off.set(null, top);
+  const at = (x: string): string => `FR${slot.get(x)![0]}[${
+    (off.get(owner.get(x)!)![slot.get(x)![0]] ?? 0) + slot.get(x)![1]}u + NZ]`;
+  const ind = (l: string): string => /^\s*/.exec(l)![0];
+  const pool = new Map<string, number>();
+  mx.sts.forEach((st, i) => {
+    const put = new Map<number, string[]>();
+    const add = (j: number, xs: string[], d: string): void => {
+      put.set(j, [...put.get(j) ?? [], ...xs.map((x) =>
+        `${d}${at(x)} = ${x};`)]);
+    };
+    st.lines.forEach((l, j) => {
+      const w = writes(l).filter((x) => slot.has(x));
+      if (w.length > 0 && l.endsWith("{")) {
+        const end = st.lines.findIndex((m, k) => k > j && m === ind(l) + "}");
+        add(j, w, ind(l) + "  ");
+        st.lines.slice(j, end).forEach((m, k) => m === ind(l) + "} else {"
+          && add(j + k, w, ind(l) + "  "));
+        add(end, w, ind(l));
+      } else if (w.length > 0) {
+        add(j, w, ind(l));
+      }
+    });
+    const n = new Map<string, number>();
+    const nm = new Map([...use[i].keys()].map((x): [string, string] => {
+      const t = ty.get(x)!;
+      n.set(t, (n.get(t) ?? 0) + 1);
+      pool.set(t, Math.max(pool.get(t) ?? 0, n.get(t)!));
+      return [x, `L${[...pool.keys()].indexOf(t)}_${n.get(t)! - 1}`];
+    }));
+    st.lines = [...[...use[i]].filter(([x, f]) => slot.has(x) && !f)
+      .map(([x]) => `${BASE}${nm.get(x)} = ${at(x)};`),
+    ...st.lines.flatMap((l, j) => [l, ...put.get(j) ?? []]).map((l) =>
+      l.replace(/(?<![\w.])[A-Za-z_]\w*/g, (x) => nm.get(x) ?? x))];
+  });
+  const n = (k: number): number => Math.max(1, (top[k] ?? 0)
+    + (size.get(null)?.[k] ?? 0));
+  return { decls: [...kinds].map(([t, k]) =>
+    `var<private> FR${k}: array<${t}, ${n(k)}>;`), at,
+    locals: [...pool].flatMap(([t, m], k) => [...Array(m).keys()].map((j) =>
+      `  var L${k}_${j}: ${t};`)) };
+}
+
+// A function of run_d3d as the translation gives it, its calls into
+// run_d3d marked, its pointer parameters copies of its own.
+function fn_mach(u: Unit, inst: string, pre: string): Mfn {
+  const [d, ps] = u.insts.get(inst)!;
+  const f = fn_of(u, inst, d);
+  const params: MPar[] = [];
+  d.inner!.filter((x) => x.kind === "ParmVarDecl").forEach((p, i) => {
+    const t = ty_of(u, p.type);
+    const name = name_new(f, p.name ?? "p");
+    const sh = ps[i];
+    f.locals.set(p.id, { name, t });
+    if (t.k === "ptr" && sh?.pk === "ref") {
+      params.push({ name, t: ty_wgsl(t.to), k: "ref" });
+      f.alias.set(name, { pk: "ref", r: name });
+    } else if (t.k === "ptr" && sh?.pk === "arr") {
+      params.push({ name, t: `array<${ty_wgsl(t.to)}, ${sh.n}>`, k: "arr" });
+      f.alias.set(name, { pk: "arr", r: name, off: name + "_o", n: sh.n });
+    } else {
+      params.push({ name, t: ty_wgsl(t), k: "val" });
+    }
+  });
+  return fn_marked(f, d, u.mach, pre, params);
+}
+
+// A declaration made an assignment: its variable is the loop's.
+function mach_line(l: string): string {
+  const m = /^(?:var|let) (\w+): ([^=;]+?)(?: = (.*))?;$/.exec(l);
+  return m === null ? l : `${m[1]} = ${m[3] ?? m[2] + "()"};`;
+}
+
+// The states' code picked by a switch on pc, the last state its default.
+// DXC compiled Bendcraft's machine in 22 s so, in 109 s picked by a tree of
+// ifs; Metal, which never runs this copy, hung on a switch in the loop.
+function pick(sts: St[], ind: string): string[] {
+  return [`${ind}switch pc {`, ...sts.flatMap((st, i) => [i < sts.length - 1
+    ? `${ind}  case ${st.id}u: {` : `${ind}  default: {`,
+  ...st.lines.map((l) => ind + "    " + l.slice(BASE.length)), `${ind}  }`]),
+  `${ind}}`];
+}
+
+function st_new(mx: Mx): St {
+  const st = { id: mx.sts.length + 1, lines: [] };
+  mx.sts.push(st);
+  return st;
+}
+
+function put(c: Cur, line: string): void {
+  c.st.lines.push(c.ind + line);
+}
+
+function go_to(c: Cur, pc: string | number): null {
+  put(c, `pc = ${typeof pc === "number" ? pc + "u" : pc};`);
+  put(c, "continue;");
+  return null;
+}
+
+// Must it be taken apart into states: does it call into run_d3d, return,
+// or break or continue out of itself?
+function hot(mx: Mx, s: Stm, loops = 0, sws = 0): boolean {
+  const top = loops + sws === 0;
+  const hit = top ? mx.hot.get(s) : undefined;
+  if (hit !== undefined) {
+    return hit;
+  }
+  const lp = "open" in s && s.open === "loop {" ? loops + 1 : loops;
+  const sw = "open" in s && s.open.startsWith("switch ") ? sws + 1 : sws;
+  const l = "line" in s ? s.line : "";
+  const h = "line" in s ? l.startsWith("@call ")
+    || !mx.local && l.startsWith("return")
+    || l === "break;" && top || (l === "continue;" || l.startsWith("break if "))
+    && loops === 0 : [...s.kids, ...s.alt ?? []].some((k) => hot(mx, k, lp,
+    sw));
+  if (top) {
+    mx.hot.set(s, h);
+  }
+  return h;
+}
+
+// Its statements from c on: where what follows them goes on, or null when
+// nothing does.
+function part(mx: Mx, xs: Stm[], cx: Cx, c: Cur | null): Cur | null {
+  for (const s of xs) {
+    if (c === null) {
+      return null;
+    }
+    c = part1(mx, s, cx, c);
+  }
+  return c;
+}
+
+function part1(mx: Mx, s: Stm, cx: Cx, c: Cur): Cur | null {
+  if (!hot(mx, s)) {
+    c.st.lines.push(...render([s], c.ind, (l) => mx.rn(mach_line(l))));
+    return c;
+  }
+  if ("line" in s) {
+    return part_line(mx, s.line, cx, c);
+  }
+  return s.open === "{" ? part(mx, s.kids, cx, c) : s.open === "loop {"
+    ? part_loop(mx, s, cx, c) : s.open.startsWith("switch ")
+    ? part_switch(mx, s, cx, c) : s.open.startsWith("if ")
+    ? part_if(mx, s, cx, c) : die("a block it cannot take apart: " + s.open);
+}
+
+function part_line(mx: Mx, l: string, cx: Cx, c: Cur): Cur | null {
+  const g = mx.fn;
+  if (l.startsWith("@call ")) {
+    return part_call(mx, g.calls[Number(l.slice(6))], c);
+  }
+  if (l.startsWith("return")) {
+    const x = l.slice(6, -1).trim();
+    if (x !== "") {
+      put(c, `${g.pre}res = ${mx.rn(x)};`);
+    }
+    return go_to(c, g.pre + "ret");
+  }
+  if (l === "break;" && c.nat.includes(cx.brk!.id)) {
+    cx.brk!.nat = true;
+    put(c, "break;");
+    return null;
+  }
+  if (l === "break;" || l === "continue;") {
+    return go_to(c, (l === "break;" ? cx.brk! : cx.cnt!).st());
+  }
+  if (l.startsWith("break if ")) {
+    put(c, `if (${mx.rn(l.slice(9, -1))}) {`);
+    go_to({ ...c, ind: c.ind + "  " }, cx.brk!.st());
+    put(c, "}");
+    return c;
+  }
+  put(c, mx.rn(mach_line(l)));
+  return c;
+}
+
+// A call: the arguments into the callee's parameters, the state after it
+// its return's, then what it returns and its pointers' copies back.
+function part_call(mx: Mx, k: Call, c: Cur): Cur {
+  const g = mx.fns.get(k.inst);
+  if (g === undefined) {
+    return part_nat(mx, k, c);
+  }
+  const back: string[] = [];
+  g.params.forEach((p, i) => {
+    const v = k.args[i];
+    const to = g.pre + p.name;
+    if (p.k === "val") {
+      put(c, `${to} = ${mx.rn(v.p?.pk === "heap" ? v.p.ix : val(v))};`);
+    } else if (v.p?.pk === "ref" || v.p?.pk === "arr") {
+      put(c, `${to} = ${mx.rn(v.p.r)};`);
+      if (v.p.pk === "arr") {
+        put(c, `${to}_o = ${mx.rn(v.p.off)};`);
+      }
+      back.push(`${mx.rn(v.p.r)} = ${to};`);
+    } else {
+      die("a pointer argument off the frame for " + k.inst);
+    }
+  });
+  const r = st_new(mx);
+  put(c, `${g.pre}ret = ${r.id}u;`);
+  go_to(c, g.entry);
+  const n: Cur = { st: r, ind: BASE, nat: [] };
+  if (k.dest !== "") {
+    put(n, `${mx.rn(k.dest)} = ${g.pre}res;`);
+  }
+  back.forEach((l) => put(n, l));
+  return n;
+}
+
+// A call through its callee's one place: the arguments into its
+// variables, pointers' copies in and out.
+function part_nat(mx: Mx, k: Call, c: Cur): Cur {
+  const n = nat_of(mx, k.inst);
+  const back: string[] = [];
+  k.args.forEach((v, i) => {
+    const a = n.args[i];
+    if (v.p?.pk === "ref" || v.p?.pk === "arr") {
+      put(c, `${a} = ${mx.rn(v.p.r)};`);
+      if (v.p.pk === "arr") {
+        put(c, `${a}_o = ${mx.rn(v.p.off)};`);
+      }
+      back.push(`${mx.rn(v.p.r)} = ${a};`);
+    } else {
+      put(c, `${a} = ${mx.rn(v.p?.pk === "heap" ? v.p.ix : val(v))};`);
+    }
+  });
+  const r = st_new(mx);
+  put(c, `${n.k} = ${r.id}u;`);
+  go_to(c, n.st.id);
+  const e: Cur = { st: r, ind: BASE, nat: [] };
+  if (k.dest !== "") {
+    put(e, `${mx.rn(k.dest)} = ${n.res};`);
+  }
+  back.forEach((l) => put(e, l));
+  return e;
+}
+
+// A callee's one place, made at its first call: its state calls it and
+// goes back.
+function nat_of(mx: Mx, inst: string): Nat {
+  const got = mx.nats.get(inst);
+  if (got !== undefined) {
+    return got;
+  }
+  const [d, ps] = mx.u.insts.get(inst)!;
+  const j = mx.nats.size;
+  const pars = d.inner!.filter((x) => x.kind === "ParmVarDecl").map((p, i)
+    : [Ty, Ptr | undefined] => [ty_of(mx.u, p.type), ps[i]]);
+  const ret = fn_of(mx.u, inst, d).ret;
+  const n: Nat = { st: st_new(mx), args: pars.map((_, i) => `n${j}_${i}`),
+    res: ret.k === "void" ? "" : `n${j}_r`, k: `n${j}_k` };
+  mx.nats.set(inst, n);
+  const vars = mx.vars;
+  pars.forEach(([t, sh], i) => {
+    if (t.k === "ptr" && sh?.pk === "arr") {
+      vars.set(n.args[i], `array<${ty_wgsl(t.to)}, ${sh.n}>`);
+      vars.set(n.args[i] + "_o", "u32");
+    } else {
+      vars.set(n.args[i], t.k === "ptr" && sh?.pk === "ref" ? ty_wgsl(t.to)
+        : ty_wgsl(t));
+    }
+  });
+  vars.set(n.k, "u32");
+  if (n.res !== "") {
+    vars.set(n.res, ty_wgsl(ret));
+  }
+  const call = `${inst}(${pars.flatMap(([t, sh], i) => t.k !== "ptr"
+    || sh?.pk === "heap" ? [n.args[i]] : sh?.pk === "arr"
+    ? [`&${n.args[i]}`, n.args[i] + "_o"] : [`&${n.args[i]}`]).join(", ")})`;
+  const c: Cur = { st: n.st, ind: BASE, nat: [] };
+  put(c, n.res === "" ? call + ";" : `${n.res} = ${call};`);
+  go_to(c, n.k);
+  return n;
+}
+
+// An if in c's state, its sides there up to a call; a side that went on in
+// another state, and the state's own way past the if, meet after it.
+function part_if(mx: Mx, s: Blk, cx: Cx, c: Cur)
+  : Cur | null {
+  const inner = { ...c, ind: c.ind + "  " };
+  put(c, mx.rn(s.open));
+  const ends = [part(mx, s.kids, cx, inner)];
+  if (s.alt !== undefined) {
+    put(c, "} else {");
+    ends.push(part(mx, s.alt, cx, inner));
+  }
+  put(c, "}");
+  const through = s.alt === undefined || ends.some((e) => e?.st === c.st);
+  const away = ends.filter((e): e is Cur => e !== null && e.st !== c.st);
+  if (away.length === 0) {
+    return through ? c : null;
+  }
+  const j = st_new(mx);
+  away.forEach((e) => go_to(e, j.id));
+  if (through) {
+    go_to(c, j.id);
+  }
+  return { st: j, ind: BASE, nat: [] };
+}
+
+// A switch in c's state, as an if with a side a case; a break stays a
+// break while in the switch's state.
+function part_switch(mx: Mx, s: Blk, cx: Cx, c: Cur)
+  : Cur | null {
+  let j: St | undefined;
+  const t: Tgt = { id: mx.ids++, st: () => (j ??= st_new(mx)).id };
+  const ci = { ...c, ind: c.ind + "  " };
+  const inner = { st: c.st, ind: c.ind + "    ", nat: [...c.nat, t.id] };
+  let through = false;
+  put(c, mx.rn(s.open));
+  for (const k of s.kids) {
+    const kk = "open" in k ? k : die("a switch's line outside its cases");
+    put(ci, kk.open);
+    const e = part(mx, kk.kids, { ...cx, brk: t }, inner);
+    if (e !== null && e.st !== c.st) {
+      go_to(e, t.st());
+    }
+    through ||= e?.st === c.st;
+    put(ci, "}");
+  }
+  put(c, "}");
+  through ||= t.nat === true;
+  if (j === undefined) {
+    return through ? c : null;
+  }
+  if (through) {
+    go_to(c, j.id);
+  }
+  return { st: j, ind: BASE, nat: [] };
+}
+
+// A loop: its head a state, its continuing another, the state after it
+// where its breaks land.
+function part_loop(mx: Mx, s: Blk, cx: Cx, c: Cur)
+  : Cur | null {
+  const cont = s.kids.find((k) => "open" in k && k.open === "continuing {");
+  const h = st_new(mx);
+  const back = cont !== undefined ? st_new(mx) : h;
+  let x: St | undefined;
+  const id = mx.ids++;
+  const inner: Cx = { brk: { id, st: () => (x ??= st_new(mx)).id },
+    cnt: { id, st: () => back.id } };
+  go_to(c, h.id);
+  const e = part(mx, s.kids.filter((k) => k !== cont), inner, { st: h,
+    ind: BASE, nat: [] });
+  if (e !== null) {
+    go_to(e, back.id);
+  }
+  if (cont !== undefined && "open" in cont) {
+    const e2 = part(mx, cont.kids, inner, { st: back, ind: BASE, nat: [] });
+    if (e2 !== null) {
+      go_to(e2, h.id);
+    }
+  }
+  return x === undefined ? null : { st: x, ind: BASE, nat: [] };
 }
 
 // Helpers
@@ -2236,8 +3025,9 @@ static u64    gpu_live;
 #define gpu_make(p) true
 #define gpu_load(b)
 
-EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
-  GpuReq* q, u32 win, u32 pix, u32 least, u32 start, u32 lines), {
+EM_JS(void, webgpu_js_open, (const char* src, const char* src_d3d,
+  const u32* tab, u32 n, GpuReq* q, u32 win, u32 pix, u32 least, u32 start),
+  {
   var end = function(v, why) {
     if (why) {
       Module.bendOn = "the ! on the cores: " + why;
@@ -2247,14 +3037,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
     Atomics.notify(HEAP32, q >> 2);
   };
   (async function() {
-    // Direct3D's compilers inline every call and take about 0.1 ms a line
-    // of the result (Chrome on Windows, an RTX 3050): Fly's run, 23
-    // thousand lines, compiled in 2.7 s; Slash Boss's, 2.1 million, not in
-    // five minutes, and the page waited on it with nothing to show.
-    if (/Windows/.test(navigator.userAgent) && lines > 100000) {
-      return end(2, "too long for Direct3D to compile: "
-        + lines.toLocaleString("en") + " lines once every call is inlined");
-    }
+    // Windows runs WebGPU on Direct3D, which gets run_d3d.
+    var d3d = /Windows/.test(navigator.userAgent);
     // A laptop with two GPUs hands out its integrated one by default, the
     // one that also draws the screen; a software adapter (SwiftShader, let
     // through by a flag) runs the rounds on the CPU, slower than the cores.
@@ -2325,7 +3109,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
       || !await G.make(Math.min(Math.ceil(start / 8192) * 65536, G.most), 0)) {
       return end(2, "no room for a corpus and its mirror");
     }
-    var mod = dev.createShaderModule({ code: UTF8ToString(src) });
+    var mod = dev.createShaderModule({ code: UTF8ToString(src)
+      + (d3d ? UTF8ToString(src_d3d) : "") });
     var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
       return m.type === "error";
     });
@@ -2339,7 +3124,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const u32* tab, u32 n,
         bindGroupLayouts: bs }) });
     };
     G.plan = await pipe("plan", [b0, b1]);
-    G.run  = await pipe("run", [b0]);
+    G.run  = await pipe(d3d ? "run_d3d" : "run", [b0]);
     G.pack = await pipe("pack", [b0]);
     G.win  = await pipe("window", [b0]);
     G.g1 = dev.createBindGroup({ layout: b1, entries: [
@@ -2553,9 +3338,9 @@ static void gpu_ask(GpuReq* q, bool run) {
 
 static bool gpu_probe(void) {
   MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5, $6,
-    $7, $8); }, GPU_SRC, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req, WG_WIN,
-    (u32)wg_qat(2), (u32)(GPU_IMG + CUBE * PAGE_LEN), (u32)GPU_START,
-    GPU_LINES);
+    $7, $8); }, GPU_SRC, GPU_D3D, GPU_TAB, sizeof GPU_TAB / 4, &gpu_req,
+    WG_WIN, (u32)wg_qat(2), (u32)(GPU_IMG + CUBE * PAGE_LEN),
+    (u32)GPU_START);
   bool ok = gpu_wait(&gpu_req);
   gpu_words = gpu_req.put[0].words;
   gpu_most  = gpu_req.put[1].words;
@@ -2901,38 +3686,19 @@ static void gpu_pass(u32 f) {
 // Export
 // ======
 
-// The lines of entry once every call in it is inlined, as Direct3D's
-// compilers do: WGSL has no recursion, so the calls form a DAG, and a
-// callee shared by many callers is counted at each.
-function inlined(src: string, entry: string): number {
-  const body = new Map(src.split(/^(?=fn \w+\()/m).map((b): [string, string] =>
-    [/^fn (\w+)/.exec(b)?.[1] ?? "", b]));
-  const memo = new Map<string, number>();
-  const size = (f: string): number => {
-    const b = body.get(f)!;
-    const n = memo.get(f) ?? [...b.slice(b.indexOf("{")).matchAll(/\b(\w+)\(/g)]
-      .filter((m) => m[1] !== f && body.has(m[1]))
-      .reduce((a, m) => a + size(m[1]), b.split("\n").length);
-    memo.set(f, n);
-    return n;
-  };
-  return size(entry);
-}
-
 // The page's lane for a program with `!`: the glue, with the WGSL and
 // TAB's words it hands the browser, written into dir, and its path, for
 // the template's BEND_WEBGPU.
 export function webgpu_page(c: string, dir: string, cc = "clang"): string {
-  const dev = device_of(ast_of(c, dir, cc));
+  const helpers = HELPERS(!/\ba32_\w+\(blk_ptr\(/.test(c));
+  const dev = device_of(ast_of(c, dir, cc), helpers);
   const tab = dev.tab.length > 0 ? dev.tab : [0];
-  const mirror = !/\ba32_\w+\(blk_ptr\(/.test(c);
-  const src = (KERNELS(tab.length) + HELPERS(mirror) + "\n" + dev.code)
-    .split("\n");
+  const src = (KERNELS(tab.length) + helpers + "\n" + dev.code).split("\n");
   const glue = path.join(dir, "webgpu.c");
-  fs.writeFileSync(glue, "static const char GPU_SRC[] =\n"
-    + src.map((l) => JSON.stringify(l + "\n")).join("\n") + ";\n\n"
-    + "static const u32 GPU_TAB[] = { " + tab.join(", ") + " };\n"
-    + "#define GPU_LINES " + Math.min(inlined(src.join("\n"), "run"),
-      2 ** 31 - 1) + "u\n" + GLUE);
+  const str = (xs: string[]): string => xs.map((l) => JSON.stringify(l + "\n"))
+    .join("\n") + ";\n\n";
+  fs.writeFileSync(glue, "static const char GPU_SRC[] =\n" + str(src)
+    + "static const char GPU_D3D[] =\n" + str(dev.d3d.split("\n"))
+    + "static const u32 GPU_TAB[] = { " + tab.join(", ") + " };\n" + GLUE);
   return glue;
 }
