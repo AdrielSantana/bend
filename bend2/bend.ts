@@ -1146,12 +1146,15 @@ export function tele_check(book: Book, lhs: LHS, tel: HTerm, xs: HTerm[], qt: Qu
   return { xs: out, us, tel };
 }
 
-export function tele_unbind(book: Book, T: HTerm): { doms: Array<[Quant, Name, HTerm]>; ret: HTerm } {
+// A telescope's domains, its erased binders filled with `ers` in order as
+// far as they go.
+export function tele_unbind(book: Book, T: HTerm, ers: HTerm[] = []): { doms: Array<[Quant, Name, HTerm]>; ret: HTerm } {
   const doms: Array<[Quant, Name, HTerm]> = [];
+  const fill = [...ers];
   let tel = T;
   for (let t = tele_open(book, tel); t !== null; t = tele_open(book, tel)) {
     doms.push([t.q, t.k, t.A]);
-    tel = t.B(Var(t.k, doms.length - 1));
+    tel = t.B(t.q.$ === "None" && fill.length > 0 ? fill.shift()! : Var(t.k, doms.length - 1));
   }
   return { doms, ret: term_wnf(book, tel) };
 }

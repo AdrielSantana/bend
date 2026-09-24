@@ -599,6 +599,8 @@ const SIGS: Map<Bend.Name, Sig> = new Map();
 
 const BRWS: Map<Bend.Name, boolean[]> = new Map();
 
+const LINKS: Map<Bend.Name, HTerm> = new Map();
+
 const SPINES: Map<HTerm, Spine> = new Map();
 
 const NODES: Map<Bend.Name, Lay> = new Map();
@@ -1151,23 +1153,37 @@ function quant_live(q: Bend.Quant): boolean {
 
 // A def's signature: its live parameters, the layouts a call passes (a
 // foreign def takes boxes and a continuation, Clo.apply a closure and
-// its argument) and its return layout (a box for those two).
-function sig_def(cb: Carb, k: Bend.Name): Sig {
-  return memo(SIGS, k, () => {
+// its argument) and its return layout (a box for those two). A fused call
+// knows the erased arguments `ers`: a parameter of an erased type that is
+// a word travels as one (Bool.pick of two U32 sinks no box).
+function sig_def(cb: Carb, k: Bend.Name, ers: HTerm[] = []): Sig {
+  return memo(SIGS, [k, ...ers.map((A) =>
+    JSON.stringify(lay_of(cb.book, A)))].join("|"), () => {
     const tld = def_body(cb, k);
     if (tld?.$ !== "Def") {
       return { live: [], lays: [BOX, BOX], ret: BOX };
     }
-    const doms = tele_unbind(cb.book, tld.T).doms;
-    const live = doms.slice(0, tld.n).filter(live_dom);
+    const doms = Bend.tele_unbind(cb.book, tld.T, ers).doms.slice(0, tld.n);
+    const live = doms.filter(live_dom);
     const lays = live.map(([, , A]) => lay_of(cb.book, A));
     if (def_foreign(tld)) {
       return { live, lays: [...lays.map(() => BOX), BOX], ret: BOX };
     }
+    const fill = [...ers];
     const ret = lay_of(cb.book, Bend.tele_fill(cb.book, tld.T,
-      Array(tld.n).fill(DUMMY), Bend.ctx_nil()));
+      doms.map((d) => live_dom(d) ? DUMMY : fill.shift() ?? DUMMY),
+      Bend.ctx_nil()));
     return { live, lays: lay_wide(lays), ret: ret.ks.length === 0 ? BOX : ret };
   });
+}
+
+// The body a fused call runs over its erased arguments `ers`: the checker
+// names a parameter in its annotations by level, out of the erased
+// binder's reach, so the body is lowered and raised again to bind them.
+function body_at(cb: Carb, k: Bend.Name, ers: HTerm[]): HTerm {
+  const h = (cb.book.tlds[k] as Def).h as HTerm;
+  return ers.length === 0 ? h
+    : memo(LINKS, k, () => Bend.term_higher(Bend.term_lower(h)));
 }
 
 // A def whose result is a Unit.
@@ -1446,7 +1462,7 @@ function def_body(cb: Carb, k: Bend.Name): TLD | undefined {
 // whether it is flat: no fork, no bang call, self-calls in tail position.
 function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
   book_owned(src);
-  [TELES, SRCS, NODES, LAYS, CYCLES, FLATS, SIGS, BRWS].forEach((m) =>
+  [TELES, SRCS, NODES, LAYS, CYCLES, FLATS, SIGS, BRWS, LINKS].forEach((m) =>
     m.clear());
   LOCAL.clear();
   for (const [k, tld] of Object.entries(src.tlds)) {
@@ -2100,14 +2116,15 @@ function emit_jump(fl: File, args: string[], k: Bend.Name,
 // owned ones popped before the borrowed ones are read (a twin keeps); a
 // read is not popped: a holder asks a lend, else val_own, and a dead rooted
 // one is let go.
-function emit_args(fl: File, ck: Call, jump = false, fork = false): string[] {
+function emit_args(fl: File, ck: Call, jump = false, fork = false,
+  ers: HTerm[] = []): string[] {
   const brw = brw_of(fl, ck.k);
   ck.all.forEach((a, q) =>
     fl.hot.has(ck.k + "~" + q) && facts_hot(fl, a, true));
   const xs = ck.args.map((a) => term_strip(a));
   const vars = xs.filter((x) => x.$ === "Var");
   const rest = fl.rest;
-  const lays = sig_def(fl, ck.k).lays;
+  const lays = sig_def(fl, ck.k, ers).lays;
   const vs = ck.args.map((a, i): Val | null => {
     if (xs[i].$ === "Var") {
       return null;
@@ -2164,15 +2181,15 @@ function emit_fuse(fl: File, ck: Call, dst: Dst, tail = false): void {
   const tld = fl.book.tlds[ck.k] as Def;
   const doms = tele_unbind(fl.book, tld.T).doms;
   const ers = ck.all.filter((_, i) => i < tld.n && !quant_live(doms[i][0]));
-  const { lays, ret } = sig_def(fl, ck.k);
+  const { lays, ret } = sig_def(fl, ck.k, ers);
   const flat = flat_of(ck.k);
-  const ws = emit_args(fl, ck, tail && !flat);
+  const ws = emit_args(fl, ck, tail && !flat, false, ers);
   if (!flat) {
     const vs = lays.map((lay) =>
       val_new(ws.splice(0, lay.ks.length), lay));
     const outer = fl.def;
     fl.def = ck.k;
-    emit_body(fl, tld.h as HTerm, tld.T, ers, vs, dst);
+    emit_body(fl, body_at(fl, ck.k, ers), tld.T, ers, vs, dst);
     fl.def = outer;
     return;
   }
@@ -2192,10 +2209,10 @@ function emit_fuse(fl: File, ck: Call, dst: Dst, tail = false): void {
 
 // Opens a unit of `k`: the unit state fresh, its parameters bound and its
 // segment made.
-function emit_open(fl: File, k: Bend.Name): Val[] {
+function emit_open(fl: File, k: Bend.Name, ers: HTerm[] = []): Val[] {
   Object.assign(fl, { spares: [], tab: 2, uses: new Map(),
     fuel: FOLD_FUEL, def: k });
-  const { live, lays, ret } = sig_def(fl, k);
+  const { live, lays, ret } = sig_def(fl, k, ers);
   const vals = lays.map((l, i) =>
     val_new(l.ks.map(() => name_local(fl, live[i][1])), l));
   brw_of(fl, k).forEach((b, i) => b && vals[i].ws.forEach((w, j) =>
@@ -2216,11 +2233,11 @@ function emit_native(fl: File, ck: Call, ers: HTerm[]): string {
   fl.spun.set(key, name);
   const tld = fl.book.tlds[ck.k] as Def;
   const outer = { ...fl };
-  const vals = emit_open(fl, ck.k);
+  const vals = emit_open(fl, ck.k, ers);
   const seg = fl.seg;
   seg.fid = name;
   const dst = val_new(seg.ret.ks.map(() => name_local(fl, "v")), seg.ret);
-  emit_body(fl, tld.h as HTerm, tld.T, ers, vals, dst);
+  emit_body(fl, body_at(fl, ck.k, ers), tld.T, ers, vals, dst);
   fl.spins.push([name, [`${seg.lines.length < SPIN_FAR ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
     seg.ks.map((k, i) => `, ${lay_c(k)} r${i}`).join("")}) {`,
   "  u32 wpoll = 0;",
