@@ -17,6 +17,9 @@
   <li><a href="?v=boss-d3d">boss-d3d</a>: Slash Boss, Direct3D copy (145 thousand)</li>
   <li><a href="?v=craft-mach">craft-mach</a>: Bendcraft, Direct3D copy, all a machine (126 thousand)</li>
   <li><a href="?v=craft">craft</a>: Bendcraft, run as shipped (11.4 million)</li>
+  <li><a href="?v=craft-g1">craft-g1</a>: Bendcraft, run_0, 5 defs cut, one kernel (240 thousand)</li>
+  <li><a href="?v=craft-g2">craft-g2</a>: Bendcraft, the same run split in 2 kernels (116 and 140 thousand each), compiled at once (<a href="?v=craft-g2&amp;seq">one at a time</a>)</li>
+  <li><a href="?v=craft-g4">craft-g4</a>: Bendcraft, the same run split in 4 kernels, a lane parking between them (60 to 81 thousand each), compiled at once (<a href="?v=craft-g4&amp;seq">one at a time</a>)</li>
   <li><a href="?v=craft-split">craft-split</a>: Bendcraft's 20 largest pieces (3 defs cut), a kernel each, compiled at once (<a href="?v=craft-split&amp;seq">one at a time</a>)</li>
 </ul>
 <div id="now"></div>
@@ -38,7 +41,8 @@ const secs = () => ((performance.now() - t0) / 1000).toFixed(1) + " s";
   dev.lost.then((x) => say("device lost at " + secs() + ": " + x.message));
   cur = v; t0 = performance.now();
   const salt = new URLSearchParams(location.search).get("salt");
-  const mod = dev.createShaderModule({ code: salt ? WGSL.replaceAll("let b = g.x * 64u;", "let b = g.x * 64u + " + salt + "u;") : WGSL });
+  const mod = dev.createShaderModule({ code: salt ? WGSL.replaceAll("let b = g.x * 64u;", "let b = g.x * 64u + " + salt + "u;")
+    .replace(/(fn run_\d+\(@builtin\(global_invocation_id\) g: vec3<u32>\) \{)/g, "$1\n  if (g.x == " + (4000000000 + Number(salt)) + "u) { return; }") : WGSL });
   const info = await mod.getCompilationInfo();
   const errs = info.messages.filter((m) => m.type === "error");
   say(v + " module: " + secs() + (errs.length ? ", error: " + errs[0].message : ""));
