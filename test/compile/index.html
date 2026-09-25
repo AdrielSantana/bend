@@ -21,6 +21,7 @@
   <li><a href="?v=craft-g4f">craft-g4f</a>: Bendcraft, craft-g4 with an error posted without a CAS loop (152 loops in the fork kernel, from 428), compiled at once (<a href="?v=craft-g4f&amp;seq">one at a time</a>)</li>
   <li><a href="?v=craft-g6f">craft-g6f</a>: Bendcraft, craft-g4f with the fork kernel split in three (23 to 34 thousand lines, about 60 loops each), compiled at once (<a href="?v=craft-g6f&amp;seq">one at a time</a>)</li>
   <li><a href="?v=craft-g6x">craft-g6x</a>: craft-g6f without the allocator's and the task node's loops, wrong and never run, to time what those loops cost (<a href="?v=craft-g6x&amp;seq">one at a time</a>)</li>
+  <li><a href="?v=craft-g6t">craft-g6t</a>: craft-g6f with a task's holes written where it is made, not in a loop (<a href="?v=craft-g6t&amp;seq">one at a time</a>)</li>
   <li><a href="?v=craft-g4">craft-g4</a>: Bendcraft, the same run split in 4 kernels, a lane parking between them (60 to 81 thousand each), compiled at once (<a href="?v=craft-g4&amp;seq">one at a time</a>)</li>
   <li><a href="?v=craft-split">craft-split</a>: Bendcraft's 20 largest pieces (3 defs cut), a kernel each, compiled at once (<a href="?v=craft-split&amp;seq">one at a time</a>)</li>
 </ul>
