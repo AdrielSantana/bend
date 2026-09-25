@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run kernel compile test</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 16px; max-width: 900px; }
+  #now { font-weight: bold; }
+</style>
+<h1>Run kernel compile test</h1>
+<p>Each link compiles one shape of a page's run kernel and runs nothing. One at a time, a fresh tab each.</p>
+<ul>
+  <li><a href="?v=fly">fly</a>: Fly, run (26 thousand lines inlined)</li>
+  <li><a href="?v=craft-cut2">craft-cut2</a>: Bendcraft, run, 3 defs cut (296 thousand)</li>
+  <li><a href="?v=craft-cut1">craft-cut1</a>: Bendcraft, run, 2 defs cut (345 thousand)</li>
+  <li><a href="?v=craft-cut0">craft-cut0</a>: Bendcraft, run, 1 def cut (787 thousand)</li>
+  <li><a href="?v=boss-d3d">boss-d3d</a>: Slash Boss, Direct3D copy (145 thousand)</li>
+  <li><a href="?v=craft-mach">craft-mach</a>: Bendcraft, Direct3D copy, all a machine (126 thousand)</li>
+  <li><a href="?v=craft">craft</a>: Bendcraft, run as shipped (11.4 million)</li>
+</ul>
+<div id="now"></div>
+<pre id="log"></pre>
+<script>
+const log = document.getElementById("log"), now = document.getElementById("now");
+const say = (s) => { log.textContent += s + "\n"; console.log("compile: " + s); };
+let t0 = 0, cur = null;
+setInterval(() => { if (cur) { now.textContent = cur + ": " + ((performance.now() - t0) / 1000).toFixed(0) + " s"; } }, 500);
+const secs = () => ((performance.now() - t0) / 1000).toFixed(1) + " s";
+(async () => {
+  const v = new URLSearchParams(location.search).get("v");
+  const ad = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!ad) { return say("no WebGPU adapter"); }
+  say("adapter: " + ad.info.vendor + " / " + ad.info.architecture + (ad.info.isFallbackAdapter ? " (fallback)" : ""));
+  if (!v) { return; }
+  await new Promise((ok, no) => { const s = document.createElement("script"); s.src = v + ".js"; s.onload = ok; s.onerror = no; document.head.appendChild(s); });
+  const dev = await ad.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize, maxBufferSize: ad.limits.maxBufferSize } });
+  dev.lost.then((x) => say("device lost at " + secs() + ": " + x.message));
+  cur = v; t0 = performance.now();
+  const mod = dev.createShaderModule({ code: WGSL });
+  const info = await mod.getCompilationInfo();
+  const errs = info.messages.filter((m) => m.type === "error");
+  say(v + " module: " + secs() + (errs.length ? ", error: " + errs[0].message : ""));
+  try {
+    await dev.createComputePipelineAsync({ layout: "auto", compute: { module: mod, entryPoint: ENTRY } });
+    say(v + " pipeline " + ENTRY + ": " + secs());
+  } catch (e) {
+    say(v + " failed at " + secs() + ": " + e);
+  }
+  cur = null; now.textContent = "done";
+})();
+</script>
