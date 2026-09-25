@@ -17,6 +17,7 @@
   <li><a href="?v=boss-d3d">boss-d3d</a>: Slash Boss, Direct3D copy (145 thousand)</li>
   <li><a href="?v=craft-mach">craft-mach</a>: Bendcraft, Direct3D copy, all a machine (126 thousand)</li>
   <li><a href="?v=craft">craft</a>: Bendcraft, run as shipped (11.4 million)</li>
+  <li><a href="?v=craft-split">craft-split</a>: Bendcraft's 20 largest pieces (3 defs cut), a kernel each, compiled at once (<a href="?v=craft-split&amp;seq">one at a time</a>)</li>
 </ul>
 <div id="now"></div>
 <pre id="log"></pre>
@@ -40,9 +41,22 @@ const secs = () => ((performance.now() - t0) / 1000).toFixed(1) + " s";
   const info = await mod.getCompilationInfo();
   const errs = info.messages.filter((m) => m.type === "error");
   say(v + " module: " + secs() + (errs.length ? ", error: " + errs[0].message : ""));
+  const pipe = (e) => dev.createComputePipelineAsync({ layout: "auto", compute: { module: mod, entryPoint: e } });
   try {
-    await dev.createComputePipelineAsync({ layout: "auto", compute: { module: mod, entryPoint: ENTRY } });
-    say(v + " pipeline " + ENTRY + ": " + secs());
+    if (typeof ENTRY === "string") {
+      await pipe(ENTRY);
+      say(v + " pipeline " + ENTRY + ": " + secs());
+    } else if (/seq/.test(location.search)) {
+      for (const [e, name, n] of ENTRY) {
+        const t = performance.now();
+        await pipe(e);
+        say(e + " " + name + " (" + n + " lines): " + ((performance.now() - t) / 1000).toFixed(1) + " s");
+      }
+      say("all, one at a time: " + secs());
+    } else {
+      await Promise.all(ENTRY.map(([e, name, n]) => pipe(e).then(() => say(e + " " + name + " (" + n + " lines) ready at " + secs()))));
+      say("all at once: " + secs());
+    }
   } catch (e) {
     say(v + " failed at " + secs() + ": " + e);
   }
