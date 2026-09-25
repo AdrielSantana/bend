@@ -12,7 +12,7 @@
 <canvas id="bend"></canvas>
 <pre><select id="bend-on"></select> <select id="bend-size"></select> <select id="bend-scale"></select> <span id="bend-rate"></span></pre>
 <pre id="bend-out"></pre>
-<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Bendcraft, split run (test)</b>: a test build: the render's run split in two kernels (116 and 140 thousand lines each once inlined, where the one kernel is 240 thousand), a lane parking its words when it leaves its kernel's group and the next kernel taking it on; ?rounds logs each bang's rounds on the console.<br>
+<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Bendcraft, split run (test)</b>: a test build: the render's run split in six kernels (23 to 58 thousand lines each once inlined, where the one kernel is 240 thousand), a lane parking its words when it leaves its kernel's group and the next kernel taking it on; ?rounds logs each bang's rounds on the console.<br>
 The selector under the picture runs the <code>!</code> on your GPU through WebGPU, or on a count of your CPU's threads.
 <a href="#" onclick="document.getElementById('bend').requestFullscreen(); return false">Fullscreen</a></p>
 <style>a { color: #8cf; }</style>
