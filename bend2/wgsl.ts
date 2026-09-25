@@ -87,6 +87,7 @@ type Unit = {
   mach: Set<string>;
   marked: Set<string>;
   pre: string;
+  grp?: Set<number>;
 };
 
 type Fn = {
@@ -167,7 +168,10 @@ const WG_DEFS = `
 #define WG_BLK   (1ull << 63)
 #define WG_LOCS  0x7FFFFFFFull
 #define WG_QCAP  (65535u * 64u)
-#define wg_qat(s)  (RING_OFF + (u64)(s) * WG_QCAP)
+#define WG_PARK  RING_OFF
+#define WG_PARKED (RING_OFF + LANES)
+#define WG_WANT  (RING_OFF + LANES + 1)
+#define wg_qat(s)  (RING_OFF + 2 * LANES + (u64)(s) * WG_QCAP)
 #define wg_q(H, s) ((H) + wg_qat(s))
 #if defined(CID_QUA) && !HOST_IMAGE
 #define WG_IMAGE CID_QUA
@@ -177,8 +181,8 @@ const WG_DEFS = `
 `;
 
 // The rounds, in the runtime's own C: a plan flips the queues and sizes
-// the next dispatch, a lane a task up to the lanes, 0 when the root is
-// done, an error was posted or nothing is queued. A lane runs its task, as
+// the next round, a lane a task up to the lanes, 0 when the root is done,
+// an error was posted or nothing is queued. A lane runs its task, as
 // monk_step does, then takes the next one nobody took, and queues what
 // each leaves: a ready parent, a fork's kids. Tasks fork until there are
 // four for each lane, then run whole, so the lanes finish together. Every
@@ -402,35 +406,56 @@ static void wg_roots(Corpus H) {
   a32_store(a32_at(H, WG_NOUT), n);
 }
 
-static u32 wg_plan(Corpus H) {
+// The queues flip once a round took every task in, and the rounds stop
+// when nothing is queued and no lane is parked. A parked lane may have any
+// index, so a round with one wakes them all. WG_WANT is how many lanes the
+// round's kernels take: each is dispatched on every lane, since an indirect
+// dispatch cost 0.6 ms on NVIDIA's Vulkan, a direct one 8 us.
+static void wg_plan(Corpus H) {
+  a32_store(a32_at(H, WG_WANT), 0);
   if (a32_load(a32_at(H, WG_STOP)) != 0) {
-    return 0;
+    return;
   }
   if (root_done(H) && a32_load(a32_at(H, WG_PACK)) == 0) {
     wg_roots(H);
   }
-  u32 n = a32_load(a32_at(H, WG_NOUT));
-  u32 m = n < LANES ? n : LANES;
-  if (n > WG_QCAP) {
+  u32  n      = a32_load(a32_at(H, WG_NOUT));
+  u32  parked = a32_load(a32_at(H, WG_PARKED));
+  bool flip   = a32_load(a32_at(H, WG_GRAB)) >= a32_load(a32_at(H, WG_NIN));
+  if (flip && n > WG_QCAP) {
     err_post(H, ERR_RING);
   }
-  if (n == 0 || err_seen(H)) {
+  if ((flip && n == 0 && parked == 0) || err_seen(H)) {
     a32_store(a32_at(H, WG_STOP), 1);
-    return 0;
+    return;
+  }
+  if (flip) {
+    a32_store(a32_at(H, WG_SEQ), n >= 4 * LANES);
+    a32_store(a32_at(H, WG_NOUT), 0);
+    a32_store(a32_at(H, WG_NIN), n);
+    a32_store(a32_at(H, WG_GRAB), 0);
+    a32_store(a32_at(H, WG_SIDE), a32_load(a32_at(H, WG_SIDE)) ^ 1);
   }
   a32_add(a32_at(H, WG_ROUND), 1);
-  a32_store(a32_at(H, WG_SEQ), n >= 4 * LANES);
-  a32_store(a32_at(H, WG_NOUT), 0);
-  a32_store(a32_at(H, WG_NIN), n);
-  a32_store(a32_at(H, WG_GRAB), m);
-  a32_store(a32_at(H, WG_SIDE), a32_load(a32_at(H, WG_SIDE)) ^ 1);
-  return (m + 63) / 64;
+  u32 left = a32_load(a32_at(H, WG_NIN)) - a32_load(a32_at(H, WG_GRAB));
+  a32_store(a32_at(H, WG_WANT), parked != 0 || left > LANES ? LANES : left);
+}
+
+// Whether the round's lane i packs or runs tasks, or neither.
+static bool wg_takes(Corpus H, u32 i, bool pack) {
+  return i < a32_load(a32_at(H, WG_WANT))
+    && (a32_load(a32_at(H, WG_PACK)) != 0) == pack;
 }
 
 static void wg_task(Corpus H, u32 i, Term t, u32 seq) {
   Env  e = { H, H + ALC_OFF + i };
   Term r = work_loop(e, (Stk)(H + STAK_OFF + i), t, seq);
   if (r == 0) {
+    return;
+  }
+  if (term_tag(r) == TAG_PAK) {
+    H[WG_PARK + i] = r;
+    a32_add(a32_at(H, WG_PARKED), 1);
     return;
   }
   Loc loc = term_loc(r);
@@ -461,12 +486,47 @@ static void wg_task(Corpus H, u32 i, Term t, u32 seq) {
   }
 }
 
+// Does this kernel's group hold the fid? Every fid does, but in a group's
+// copy of the run, whose switches on fid keep the group's cases alone.
+static bool wg_mine(Fid fid) {
+#define WL_X(F) case F:
+  switch (fid) {
+  WL_TABLE WL_X(FID_ENTER)
+    return true;
+  }
+#undef WL_X
+  return false;
+}
+
+// A lane parked on a fid of this kernel's group runs on, and an idle one
+// takes the tasks nobody took, until one parks; one call of wg_task, since
+// every call inlines the work loop.
 static void wg_run(Corpus H, u32 i) {
-  u32 n    = a32_load(a32_at(H, WG_NIN));
-  u32 seq  = a32_load(a32_at(H, WG_SEQ));
-  u32 side = a32_load(a32_at(H, WG_SIDE));
-  for (u32 j = i; j < n && !err_seen(H); j = a32_add(a32_at(H, WG_GRAB), 1)) {
-    wg_task(H, i, wg_q(H, side)[j], seq);
+  if (!wg_takes(H, i, false)) {
+    return;
+  }
+  u32      n    = a32_load(a32_at(H, WG_NIN));
+  u32      seq  = a32_load(a32_at(H, WG_SEQ));
+  u32      side = a32_load(a32_at(H, WG_SIDE));
+  DEV u64* pk   = H + WG_PARK + i;
+  Term     t    = *pk;
+  if (t != 0) {
+    if (!wg_mine((Fid)term_aux(t))) {
+      return;
+    }
+    *pk = 0;
+    a32_add(a32_at(H, WG_PARKED), 0xFFFFFFFFu);
+  }
+  while (*pk == 0 && !err_seen(H)) {
+    if (t == 0) {
+      u32 j = a32_add(a32_at(H, WG_GRAB), 1);
+      if (j >= n) {
+        return;
+      }
+      t = wg_q(H, side)[j];
+    }
+    wg_task(H, i, t, seq);
+    t = 0;
   }
 }
 
@@ -474,17 +534,17 @@ static void wg_run(Corpus H, u32 i) {
 // pack's code made Slash Boss 3D's first bang allocate past the heap in its
 // eighth round, before any packing, on most runs.
 static void wg_packs(Corpus H, u32 i) {
+  if (!wg_takes(H, i, true)) {
+    return;
+  }
   u32 n    = a32_load(a32_at(H, WG_NIN));
   u32 side = a32_load(a32_at(H, WG_SIDE));
   Loc r0   = H[WG_PR0];
   Loc end  = HEAP_OFF + ((Loc)a32_load(a32_at(H, H_CAP)) << PAGE_BITS);
-  for (u32 j = i; j < n && !err_seen(H); j = a32_add(a32_at(H, WG_GRAB), 1)) {
+  for (u32 j = a32_add(a32_at(H, WG_GRAB), 1); j < n && !err_seen(H);
+    j = a32_add(a32_at(H, WG_GRAB), 1)) {
     wg_pack(H, wg_q(H, side)[j], r0, end);
   }
-}
-
-static u32 wg_packing(Corpus H) {
-  return a32_load(a32_at(H, WG_PACK));
 }
 
 // A kept Image's square, a lane a pixel, as the native window_dev draws
@@ -514,8 +574,8 @@ function die(m: string): never {
 
 // The device C: the template's CUDA dialect with ROUNDS appended,
 // preprocessed, its C++ kernels cut (the rounds replace them), and typed by
-// clang.
-function ast_of(c: string, dir: string, cc: string): N {
+// clang; with WG_GROUPS when the run is split in groups.
+function ast_of(c: string, dir: string, cc: string, groups: boolean): N {
   const src = path.join(dir, "dev.c");
   const pre = path.join(dir, "dev.i");
   const dev = path.join(dir, "dev2.c");
@@ -528,8 +588,8 @@ function ast_of(c: string, dir: string, cc: string): N {
     }
     return r.stdout;
   };
-  run(["-E", "-P", "-D__CUDACC_RTC__", "-DCUBE_LOG=7", "-x", "c", src, "-o",
-    pre]);
+  run(["-E", "-P", "-D__CUDACC_RTC__", "-DCUBE_LOG=7",
+    ...groups ? ["-DWG_GROUPS"] : [], "-x", "c", src, "-o", pre]);
   const ls = fs.readFileSync(pre, "utf8").split("\n");
   const keep: string[] = [];
   for (let i = 0; i < ls.length; i += 1) {
@@ -1348,12 +1408,15 @@ function arith(op: string, a: Val, b: Val, t: Ty): Val {
 }
 
 // Pointer arithmetic and comparison: an offset scales by the element's
-// words; two pointers compare as corpus indices.
+// words; two pointers compare and subtract as corpus indices.
 function ex_ptr(f: Fn, op: string, a: Val, b: Val, t: Ty): Val {
   if (a.p !== undefined && b.p !== undefined) {
-    return CMPS.includes(op) && a.p.pk === "heap" && b.p.pk === "heap"
-      ? { s: `(${a.p.ix} ${op} ${b.p.ix})`, t, b: true }
-      : die("a pointer difference, or a comparison off the corpus");
+    return a.p.pk !== "heap" || b.p.pk !== "heap"
+      ? die("two pointers off the corpus")
+      : CMPS.includes(op) ? { s: `(${a.p.ix} ${op} ${b.p.ix})`, t, b: true }
+      : op === "-" ? conv({ s: `((i32(${a.p.ix}) - i32(${b.p.ix})) / ${
+        ty_words(ptr_to(a))})`, t: I32 }, t)
+      : die("a pointer operator " + op);
   }
   const [p, i] = a.p !== undefined ? [a, b] : [b, a];
   if (op !== "+" && !(op === "-" && a.p !== undefined)) {
@@ -1586,8 +1649,7 @@ function ex_call(f: Fn, n: N, t: Ty): Val {
     return die("a call to " + name + ", which the device does not hold");
   }
   if (f.calls !== undefined) {
-    const got = f.u.done.get(name + "|" + shape(name, vs.map((v) => v.p))
-      .join(""));
+    const got = f.u.done.get(inst_key(f.u, name, vs.map((v) => v.p)));
     if (got !== undefined && f.to!.has(got)) {
       const dest = t.k === "void" ? "" : "t" + f.tmp++;
       emit(f, "@call " + f.calls.length);
@@ -1613,14 +1675,24 @@ function shape(name: string, ps: (Ptr | undefined)[]): string[] {
     : die("a table passed to " + name));
 }
 
+// A group's kernel copies the run down to the switch on fid; the rest it
+// shares.
+const GROUPED = ["wg_run", "wg_task", "work_loop", "wg_mine"];
+
+function inst_key(u: Unit, name: string, ps: (Ptr | undefined)[]): string {
+  return (GROUPED.includes(name) ? u.pre : "") + name + "|"
+    + shape(name, ps).join("");
+}
+
 function inst_of(u: Unit, name: string, ps: (Ptr | undefined)[]): string {
   const shape_ = shape(name, ps);
-  const key = name + "|" + shape_.join("");
+  const key = inst_key(u, name, ps);
   const hit = u.done.get(key);
   if (hit !== undefined) {
     return hit;
   }
-  const inst = u.pre + name + (shape_.some((s) => s !== "h") ? "_"
+  const pre = u.grp === undefined || GROUPED.includes(name) ? u.pre : "c_";
+  const inst = pre + name + (shape_.some((s) => s !== "h") ? "_"
     + shape_.join("") : "");
   u.done.set(key, inst);
   u.todo.push([inst, u.fns.get(name)!, ps as Ptr[]]);
@@ -1794,7 +1866,8 @@ function st_do(f: Fn, b: N, c: N): void {
 }
 
 // A switch: labels grouped, and a group that can fall through runs the
-// next group's statements after its own, as C falls into them.
+// next group's statements after its own, as C falls into them. In a group's
+// copy of the run, a switch on fid keeps the group's labels alone.
 function st_switch(f: Fn, n: N): void {
   const [c, b] = n.inner!;
   const sel = ex(f, c);
@@ -1802,6 +1875,8 @@ function st_switch(f: Fn, n: N): void {
   if (t.k !== "int" || t.w === 64) {
     return die("a switch on a " + t.k);
   }
+  const grp = f.name.startsWith(f.u.pre) && var_of(c) === "fid" ? f.u.grp
+    : undefined;
   const groups: { labels: string[]; body: N[] }[] = [];
   let cur: { labels: string[]; body: N[] } | null = null;
   for (let s of b.inner ?? []) {
@@ -1810,14 +1885,18 @@ function st_switch(f: Fn, n: N): void {
         cur = { labels: [], body: [] };
         groups.push(cur);
       }
-      cur.labels.push(s.kind === "DefaultStmt" ? "default" : lit(t,
-        fold(f.u, s.inner![0]) ?? die("a case that does not fold")).s);
+      const k = s.kind === "DefaultStmt" ? null : fold(f.u, s.inner![0])
+        ?? die("a case that does not fold");
+      if (k === null || grp === undefined || grp.has(Number(k))) {
+        cur.labels.push(k === null ? "default" : lit(t, k).s);
+      }
       s = s.inner![s.inner!.length - 1];
     }
     (cur ?? die("a statement before a switch's first case")).body.push(s);
   }
   nest(f, `switch (${val(sel)}) {`, () => {
-    groups.forEach((g, i) => nest(f, `case ${g.labels.join(", ")}: {`, () => {
+    groups.forEach((g, i) => g.labels.length > 0 && nest(f,
+      `case ${g.labels.join(", ")}: {`, () => {
       for (let j = i; j < groups.length; j += 1) {
         groups[j].body.forEach((x) => stmt(f, x));
         if (!falls(groups[j].body)) {
@@ -1829,6 +1908,12 @@ function st_switch(f: Fn, n: N): void {
       nest(f, "default: {", () => {});
     }
   });
+}
+
+// The variable an expression reads, if it is one.
+function var_of(n: N): string | undefined {
+  return n.kind === "DeclRefExpr" ? n.referencedDecl?.name
+    : n.kind === "ImplicitCastExpr" ? var_of(n.inner![0]) : undefined;
 }
 
 // Can control run past the last statement?
@@ -1967,31 +2052,36 @@ function fn_body(f: Fn, d: N): void {
 }
 
 // The device program: the functions the plan, the packing and the window
-// reach and the records the rounds pass by value; run with the functions
-// only it reaches; Direct3D's run with its own copy of the functions it
-// reaches; and TAB's words. A page compiles the first with run, or on
-// Windows with Direct3D's.
-function device_of(ast: N, helpers: string)
+// reach and the records the rounds pass by value; the runs, a kernel a
+// group of fids, run_0.., with the functions only they reach; Direct3D's
+// run with its own copy of the functions it reaches; and TAB's words. A
+// page compiles the first with the runs, or on Windows with Direct3D's.
+function device_of(ast: N, helpers: string, gs: Set<number>[])
   : { code: string; run: string; d3d: string; tab: number[] } {
   const u = unit_new(ast);
-  ["wg_plan", "wg_packing", "wg_packs", "wg_window"].forEach((f) =>
+  ["wg_plan", "wg_packs", "wg_window"].forEach((f) =>
     inst_of(u, f, []));
   const fns = translated(u);
   const shared = fns.size;
-  inst_of(u, "wg_run", []);
-  const all = [...translated(u, fns).values()];
+  const runs = gs.map((grp, g) => {
+    const v: Unit = gs.length > 1 ? { ...u, pre: `g${g}_`, grp } : u;
+    const run = inst_of(v, "wg_run", []);
+    translated(v, fns);
+    return ["@compute @workgroup_size(64)",
+      `fn run_${g}(@builtin(global_invocation_id) g: vec3<u32>) {`,
+      `  ${run}(0u, g.x);`, "}"].join("\n");
+  });
+  const all = [...fns.values()];
   const v: Unit = { ...u, done: new Map(), todo: [], insts: new Map(),
     mach: new Set(), marked: new Set(), pre: "d_" };
   inst_of(v, "wg_run", []);
-  const d3d = run_d3d(v, helpers, translated(v));
+  const d3d = gs.length > 1 ? "" : run_d3d(v, helpers, translated(v));
   const recs = [...u.recs.keys()].map((id) => ty_rec(u, id)).filter((t) =>
     t.k === "rec" && !t.union && t.fs.length > 0).map((t) => t.k === "rec"
     ? `struct ${ty_wgsl(t)} { ${t.fs.map((x) => `f_${x.name}: `
       + ty_wgsl(x.t)).join(", ")} }\n` : "");
   return { code: recs.join("") + all.slice(0, shared).join("\n"),
-    run: ["@compute @workgroup_size(64)",
-      "fn run(@builtin(global_invocation_id) g: vec3<u32>) {",
-      "  c_wg_run(0u, g.x);", "}", ...all.slice(shared)].join("\n"), d3d,
+    run: [...runs, ...all.slice(shared)].join("\n"), d3d,
     tab: u.tab };
 }
 
@@ -2919,26 +3009,15 @@ fn c_pow(x: f32, y: f32) -> f32 {
 // =======
 
 // The corpus and its mirror, as long as the buffers bound (they grow,
-// gpu_grow; a length fixed in the shader read no faster), the tables for
-// both, and the run's indirect arguments the plan writes, a buffer of its
-// own since a dispatch cannot read one it binds for writing.
+// gpu_grow; a length fixed in the shader read no faster), and the tables.
 const KERNELS = (tab: number) => String.raw`
 @group(0) @binding(0) var<storage, read_write> M: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read> TAB: array<u32, ${tab}>;
 @group(0) @binding(2) var<storage, read_write> P: array<u32>;
-@group(1) @binding(0) var<storage, read_write> A: array<u32, 6>;
 
-// The next round's groups, for run's tasks or pack's jobs.
 @compute @workgroup_size(1)
 fn plan() {
-  let n = c_wg_plan(0u);
-  let k = c_wg_packing(0u) != 0u;
-  A[0] = select(n, 0u, k);
-  A[1] = 1u;
-  A[2] = 1u;
-  A[3] = select(0u, n, k);
-  A[4] = 1u;
-  A[5] = 1u;
+  c_wg_plan(0u);
 }
 
 @compute @workgroup_size(64)
@@ -3032,7 +3111,7 @@ static u64    gpu_live;
 
 EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
   const char* src_d3d, const u32* tab, u32 n, GpuReq* q, u32* ready, u32 win,
-  u32 pix, u32 least, u32 start),
+  u32 pix, u32 least, u32 start, u32 groups),
   {
   var end = function(v, why) {
     if (why) {
@@ -3043,8 +3122,12 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
     Atomics.notify(HEAP32, q >> 2);
   };
   (async function() {
-    // Windows runs WebGPU on Direct3D, which gets run_d3d.
+    // Windows runs WebGPU on Direct3D, which gets run_d3d when there is one.
     var d3d = /Windows/.test(navigator.userAgent);
+    var runs = d3d && UTF8ToString(src_d3d).trim() !== "" ? ["run_d3d"]
+      : UTF8ToString(src_run).match(/fn run_[0-9]+/g).map(function(f) {
+        return f.slice(3);
+      });
     // A laptop with two GPUs hands out its integrated one by default, the
     // one that also draws the screen; a software adapter (SwiftShader, let
     // through by a flag) runs the rounds on the CPU, slower than the cores.
@@ -3068,13 +3151,10 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
     G.T = dev.createBuffer({ size: Math.max(n, 1) * 4,
       usage: U.STORAGE | U.COPY_DST });
     dev.queue.writeBuffer(G.T, 0, HEAPU32.slice(tab >> 2, (tab >> 2) + n));
-    G.A = dev.createBuffer({ size: 32, usage: U.STORAGE | U.INDIRECT });
     var b0 = dev.createBindGroupLayout({ entries: [
       { binding: 0, visibility: C, buffer: { type: "storage" } },
       { binding: 1, visibility: C, buffer: { type: "read-only-storage" } },
       { binding: 2, visibility: C, buffer: { type: "storage" } }] });
-    var b1 = dev.createBindGroupLayout({ entries: [
-      { binding: 0, visibility: C, buffer: { type: "storage" } }] });
     // The corpus and its mirror, bytes each, the last ones' first keep bytes
     // carried over and the rest zeroed now: WebGPU zeroes a buffer at its
     // first use, and a ! would pay it (~100 ms for 4 GiB on an M5). False
@@ -3115,8 +3195,6 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
       || !await G.make(Math.min(Math.ceil(start / 8192) * 65536, G.most), 0)) {
       return end(2, "no room for a corpus and its mirror");
     }
-    G.g1 = dev.createBindGroup({ layout: b1, entries: [
-      { binding: 0, resource: { buffer: G.A } }] });
     // A band of a kept Image's square drawn into the third queue
     // (wg_window): its node, then its size and level, in four words.
     G.band = function(lo, hi, a, b) {
@@ -3132,6 +3210,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
       return enc;
     };
     G.pix = pix * 8;
+    G.groups = groups;
     // Direct3D takes seconds to minutes to compile a program's shader, off
     // the page's thread: the program waits a second for it, then starts
     // with its ! on the cores, and the ! moves to the GPU when its pipelines
@@ -3153,7 +3232,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
     };
     var compiled = (async function() {
       var mod = dev.createShaderModule({ code: UTF8ToString(src)
-        + UTF8ToString(d3d ? src_d3d : src_run) });
+        + UTF8ToString(runs[0] === "run_d3d" ? src_d3d : src_run) });
       var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
         return m.type === "error";
       });
@@ -3165,9 +3244,12 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
           entryPoint: name }, layout: dev.createPipelineLayout({
           bindGroupLayouts: bs }) });
       };
-      [G.plan, G.run, G.pack, G.win] = await Promise.all([
-        pipe("plan", [b0, b1]), pipe(d3d ? "run_d3d" : "run", [b0]),
-        pipe("pack", [b0]), pipe("window", [b0])]);
+      var ps = await Promise.all([pipe("plan", [b0]), pipe("pack", [b0]),
+        pipe("window", [b0])].concat(runs.map(function(f) {
+          return pipe(f, [b0]);
+        })));
+      [G.plan, G.pack, G.win] = ps;
+      G.runs = ps.slice(3);
     })().then(function() {
       set(1, "the ! on " + [ad.info.vendor, ad.info.architecture,
         ad.info.description].filter(Boolean).join(" ") + ", compiled in "
@@ -3239,14 +3321,12 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
       for (var r = 0; r < k; r += 1) {
         pass.setPipeline(G.plan);
         pass.setBindGroup(0, G.g0);
-        pass.setBindGroup(1, G.g1);
         pass.dispatchWorkgroups(1);
-        pass.setPipeline(G.run);
-        pass.setBindGroup(0, G.g0);
-        pass.dispatchWorkgroupsIndirect(G.A, 0);
-        pass.setPipeline(G.pack);
-        pass.setBindGroup(0, G.g0);
-        pass.dispatchWorkgroupsIndirect(G.A, 12);
+        G.runs.concat([G.pack]).forEach(function(k) {
+          pass.setPipeline(k);
+          pass.setBindGroup(0, G.g0);
+          pass.dispatchWorkgroups(G.groups);
+        });
       }
       pass.end();
       enc.copyBufferToBuffer(G.M, 0, G.head, 0, bw);
@@ -3380,9 +3460,9 @@ static void gpu_ask(GpuReq* q, bool run) {
 
 static bool gpu_probe(void) {
   MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5, $6,
-    $7, $8, $9, $10); }, GPU_SRC, GPU_RUN, GPU_D3D, GPU_TAB,
+    $7, $8, $9, $10, $11); }, GPU_SRC, GPU_RUN, GPU_D3D, GPU_TAB,
     sizeof GPU_TAB / 4, &gpu_req, &gpu_compiled, WG_WIN, (u32)wg_qat(2),
-    (u32)(GPU_IMG + CUBE * PAGE_LEN), (u32)GPU_START);
+    (u32)(GPU_IMG + CUBE * PAGE_LEN), (u32)GPU_START, (u32)(LANES / 64));
   bool ok = gpu_wait(&gpu_req);
   gpu_words = gpu_req.put[0].words;
   gpu_most  = gpu_req.put[1].words;
@@ -3682,7 +3762,7 @@ static void gpu_pass(u32 f) {
       (u32)(s->top - s->dst_at) };
     q->put[3] = (GpuPut){ (u32)wg_qat(1), (u32)(uintptr_t)&task, 1 };
     q->zero_at    = ALC_OFF;
-    q->zero_words = CUBE * 2 * ALC_WORDS;
+    q->zero_words = RING_OFF - ALC_OFF + 2 * LANES;
     q->stop       = WG_STOP;
     q->back       = (u32)(uintptr_t)gpu_head;
     q->back_words = GPU_HEAD;
@@ -3725,6 +3805,21 @@ static void gpu_pass(u32 f) {
 }
 `;
 
+// The run's groups, a kernel each: the fids of the names each of
+// WGSL_GROUPS's patterns (;-separated) matches, the last group those none
+// matches; the runtime's segments are in every group.
+function groups_of(c: string): Set<number>[] {
+  const pats = (process.env.WGSL_GROUPS ?? "").split(";").filter(Boolean)
+    .map((p) => new RegExp(p));
+  const gs = [...Array(Math.max(pats.length, 1))].map(() => new Set<number>());
+  for (const [, name, v] of c.matchAll(/^#define FID_(\w+) (\d+)$/gm)) {
+    const ks = ["ENTER", "EXIT", "CLO_APPLY", "IO_EMIT"].includes(name)
+      ? gs.map((_, k) => k) : pats.flatMap((p, k) => p.test(name) ? [k] : []);
+    (ks.length > 0 ? ks : [gs.length - 1]).forEach((k) => gs[k].add(Number(v)));
+  }
+  return gs;
+}
+
 // Export
 // ======
 
@@ -3733,7 +3828,8 @@ static void gpu_pass(u32 f) {
 // the template's BEND_WEBGPU.
 export function webgpu_page(c: string, dir: string, cc = "clang"): string {
   const helpers = HELPERS(!/\ba32_\w+\(blk_ptr\(/.test(c));
-  const dev = device_of(ast_of(c, dir, cc), helpers);
+  const gs = groups_of(c);
+  const dev = device_of(ast_of(c, dir, cc, gs.length > 1), helpers, gs);
   const tab = dev.tab.length > 0 ? dev.tab : [0];
   const src = KERNELS(tab.length) + helpers + "\n" + dev.code;
   const glue = path.join(dir, "webgpu.c");

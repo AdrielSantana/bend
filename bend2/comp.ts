@@ -2084,6 +2084,15 @@ function emit_task(fl: File, fid: string, rem: number, words: string[],
     `task_node(e, ${seg_ref(fl, fid)}, ${cont}, ${idx}, ${rem})`, words);
 }
 
+// A task waiting on results holds a hole where each will land, and its
+// slots are written here, not in a loop over its arity: WGSL reads the
+// arity from a buffer, and every loop costs the GPU's compiler.
+function emit_holes(fl: File, nd: string, from: number, n: number): void {
+  for (let j = from; j < from + n; j += 1) {
+    file_push(fl, `e.mem[${nd} + ${j}] = TERM_HOLE;`);
+  }
+}
+
 function emit_frame(fl: File, words: string[], next: string): void {
   const ws = [...words, seg_ref(fl, next)];
   file_push(fl, `WL_ROOM(${ws.length});`);
@@ -2240,10 +2249,10 @@ function emit_native(fl: File, ck: Call, ers: HTerm[]): string {
   emit_body(fl, body_at(fl, ck.k, ers), tld.T, ers, vals, dst);
   fl.spins.push([name, [`${seg.lines.length < SPIN_FAR ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
     seg.ks.map((k, i) => `, ${lay_c(k)} r${i}`).join("")}) {`,
-  "  u32 wpoll = 0;",
+  ...seg.spin ? ["  u32 wpoll = 0;"] : [],
   ...dst.ws.map((v, j) => `  ${lay_c(seg.ret.ks[j])} ${v} = 0;`),
   ...seg_take(seg).map((l) => "  " + l),
-  "  WL_SPIN", ...seg.lines, "  break;", "  }",
+  ...seg.spin ? ["  WL_SPIN", ...seg.lines, "  break;", "  }"] : seg.lines,
   ...dst.ws.map((v, j) => `  o[${j}] = ${v};`),
   "  return 1;", "}"].join("\n"), seg.refs]);
   Object.assign(fl, outer);
@@ -2617,9 +2626,11 @@ function emit_fork(fl: File, x: HLet, ers: HTerm[]): void {
       let idx = caps.length;
       calls.forEach((c, j) => {
         const fj = seg_fid(c.k);
+        const w = sig_def(fl, c.k).ret.ks.length;
         file_push(fl, `e.mem[${jn} + ${idx}] = term_tsk(${fj}, ${
           emit_task(fl, fj, 0, margs[j], jt, idx)});`);
-        idx += sig_def(fl, c.k).ret.ks.length;
+        emit_holes(fl, jn, idx + 1, w - 1);
+        idx += w;
       });
       file_push(fl, `return ${jt};`);
     });
@@ -2646,8 +2657,9 @@ function emit_fork(fl: File, x: HLet, ers: HTerm[]): void {
       frame();
     } else {
       emit_chain(fl, () => "seq", [frame, () => {
-        file_push(fl, `WL_CONT = term_tsk(${seg_fid(kn)}, ${
-          emit_task(fl, seg_fid(kn), 1, ws)});`);
+        const nd = emit_task(fl, seg_fid(kn), 1, ws);
+        emit_holes(fl, nd, ws.length, sig_def(fl, c.k).ret.ks.length);
+        file_push(fl, `WL_CONT = term_tsk(${seg_fid(kn)}, ${nd});`);
         file_push(fl, `WL_IDX = ${ws.length};`);
       }]);
     }
@@ -2997,13 +3009,16 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
   const rs = [...Array(n).keys()].map((i) => "r" + i);
   const ws = n > 6 ? [...rs.slice(0, 6), "rp", ...rs.slice(6)] : rs;
   // a ladder: a fallthrough switch's phi cascade costs clang O(n^2) to build
-  const load = rs.map((r, i) =>
-    `    if ((N) <= ${i}) break; ${r} = e.mem[(A) + ${i}]; \\\n`).join("");
+  const ladder = (f: (r: string, i: number) => string): string =>
+    `  do { \\\n${rs.map((r, i) => `    if ((N) <= ${i}) break; ${f(r, i)}; \\\n`)
+      .join("")}  } while (0);`;
   const last = rs.map((r, i) =>
     `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
   `#define WL_BANK Term ${ws.join(", ")};`, "",
-  `#define WL_LOAD(A, N) \\\n  do { \\\n${load}  } while (0);`, "",
+  `#define WL_LOAD(A, N) \\\n${ladder((r, i) => `${r} = e.mem[(A) + ${i}]`)}`,
+  "", `#define WL_STOW(N) \\\n${ladder((r, i) => `STK(${i}) = ${r}`)}`, "",
+  `#define WL_UNSTOW(N) \\\n${ladder((r, i) => `${r} = STK(${i})`)}`, "",
   `#define WL_LAST(X) \\\n  switch (war) { \\\n${last}  }`, "",
   `#define WL_SAVE(V) ${rs.slice(0, resw).map((r, j) =>
     `(V)[${j}] = ${r};`).join(" ")}`, "",
@@ -3672,7 +3687,7 @@ typedef u32* Cur;
 
 #define PAGE_UP(n) (((n) + PAGE_LEN - 1) & ~(PAGE_LEN - 1))
 #define ALC_OFF  PAGE_UP(H_BANK + 3 * NCLS_ALL)
-#define RING_OFF (ALC_OFF + CUBE * 2 * ALC_WORDS)
+#define RING_OFF (ALC_OFF + CUBE * 3 * ALC_WORDS)
 #define STAK_OFF (RING_OFF + CUBE * RING_WORDS)
 #define STAT_OFF (STAK_OFF + CUBE * STAK_LEN)
 #define HEAP_OFF (STAT_OFF + PAGE_UP(STAT_LEN))
@@ -3685,7 +3700,7 @@ typedef u32* Cur;
 typedef pthread_mutex_t lock;
 
 static Corpus CORPUS;
-static u64    ALC[CUBE_T + 1][3 * ALC_WORDS] __attribute__((aligned(128)));
+static u64    ALC[CUBE_T + 1][4 * ALC_WORDS] __attribute__((aligned(128)));
 static u32    KEEP_WORDS;
 // the bag: 2^CUBE_LOG groups of CUBE_T lanes (a -D constant on the device)
 static u32    CUBE_LOG = 7;
@@ -3855,9 +3870,12 @@ INLINE u32 a32_cmpx(DEV u32* p, u32 x, u32 v) {
 
 #if DEVICE
 
+// the first error stays, but for two posted at once; a CAS would need a loop
+// at every site, and a GPU's compiler pays for each
 INLINE void err_post(Corpus H, Err code) {
-  u32 seen = 0;
-  while (seen == 0 && !a32_cas(a32_at(H, H_ERROR_CODE), &seen, code)) {}
+  if (a32_load(a32_at(H, H_ERROR_CODE)) == 0) {
+    a32_store(a32_at(H, H_ERROR_CODE), code);
+  }
 }
 
 #else
@@ -3937,24 +3955,28 @@ INLINE void bank_push(Corpus H, Cls c, Loc head) {
 
 // Per lane and class (a tile row on the device): HOT, a LIFO chain of
 // free slots (word 0 the head it replaced); LEN, its exact length in
-// words, off the chain; on the host COLD, one generation. A free is a
-// push and an add. A host free at KEEP_WORDS (a slot for a wide class)
-// runs heap_hand: COLD to the bank, HOT parked as COLD, generations
-// exact. A miss takes COLD, else a bank entry, else a quantum of at
-// most a generation, and sets LEN to what it took: no adoption past a
+// words, off the chain; RUN, the slots of the lane's last quantum not
+// yet handed, never chained (the first holds how many are left: a loop
+// to chain them cost the GPU's compiler at every alloc site); on the
+// host COLD, one generation. A free is a push and an add. A host free
+// at KEEP_WORDS (a slot for a wide class) runs heap_hand: COLD to the
+// bank, HOT parked as COLD, generations exact. A miss takes RUN's next,
+// else COLD, else a bank entry, and sets LEN to what it took, else a
+// quantum of at most a generation as RUN: no adoption past a
 // generation, no list re-aged. A device lane keeps its frees for the
 // pass; at the kernel end dev_cut hands its complete generations,
 // walking only those. KEEP_WORDS is CAP_WORDS, or CHUNK with the GPU
 // (fixed at boot), so a device lane may adopt every host entry.
 // Bounds: a host lane and class under 2 max(KEEP_WORDS, 2^c) words, a
 // device one under max(CHUNK, 2^c) after each kernel plus its own
-// frees within one, bank entries exact. The bump grows only when this
-// lane's HOT and COLD and the class's bank are empty. A zero row is an
-// empty lane.
+// frees within one, and a quantum in RUN, bank entries exact. The bump
+// grows only when this lane's HOT, RUN and COLD and the class's bank are
+// empty. A zero row is an empty lane.
 
 #define ALC_AT(e, i)   (e).alc[(i) * LANE_STEP]
 #define ALC_LEN(e, c)  ALC_AT(e, ALC_WORDS + (c))
-#define ALC_COLD(e, c) ALC_AT(e, 2 * ALC_WORDS + (c))
+#define ALC_RUN(e, c)  ALC_AT(e, 2 * ALC_WORDS + (c))
+#define ALC_COLD(e, c) ALC_AT(e, 3 * ALC_WORDS + (c))
 #define KEEP(c)        (KEEP_WORDS >> (c) ? KEEP_WORDS >> (c) : 1)
 
 OUTLINE void heap_hand(Env e, Cls cls) {
@@ -3974,17 +3996,23 @@ static bool corpus_grow(Corpus H, u64 need);
 #endif
 
 OUTLINE Loc heap_alloc_miss(Env e, Cls cls) {
-  Corpus H = e.mem;
-  Loc  got = 0;
-  if (!DEVICE) {
-    got = ALC_COLD(e, cls);
-    ALC_COLD(e, cls) = 0;
-  }
+  Corpus   H   = e.mem;
+  DEV u64* run = &ALC_RUN(e, cls);
+  Loc      got = *run;
   if (!got) {
-    got = bank_pop(H, cls);
-  }
-  u32 n = got ? KEEP(cls) : cls < NCLS ? QUANTUM >> cls : 1;
-  if (!got) {
+    if (!DEVICE) {
+      got = ALC_COLD(e, cls);
+      ALC_COLD(e, cls) = 0;
+    }
+    if (!got) {
+      got = bank_pop(H, cls);
+    }
+    if (got) {
+      ALC_AT(e, cls)  = H[got];
+      ALC_LEN(e, cls) = (u64)(KEEP(cls) - 1) << cls;
+      return got;
+    }
+    u32 n     = cls < NCLS ? QUANTUM >> cls : 1;
     u32 pages = (n << cls) >> PAGE_BITS;
     u32 p     = a32_add(a32_at(H, H_BUMP), pages);
     if ((u64)p + pages > a32_load_acq(a32_at(H, H_CAP))
@@ -3992,13 +4020,15 @@ OUTLINE Loc heap_alloc_miss(Env e, Cls cls) {
       err_post(H, ERR_HEAP);
       return HEAP_OFF;
     }
-    got = HEAP_OFF + ((u64)p << PAGE_BITS);
-    for (u32 i = 1; i <= n; i += 1) {
-      H[got + ((u64)(i - 1) << cls)] = i < n ? got + ((u64)i << cls) : 0;
-    }
+    got    = HEAP_OFF + ((u64)p << PAGE_BITS);
+    H[got] = n;
   }
-  ALC_AT(e, cls)  = H[got];
-  ALC_LEN(e, cls) = (u64)(n - 1) << cls;
+  u64 left = H[got];
+  Loc next = left > 1 ? got + (1ull << cls) : 0;
+  *run = next;
+  if (next) {
+    H[next] = left - 1;
+  }
   return got;
 }
 
@@ -4472,9 +4502,6 @@ INLINE Ring ring_flip(u32 i) {
 INLINE Loc task_node(Env e, Fid fid, Term cont, u32 idx, u32 rem) {
   u32 ar  = fid_arity(fid);
   Loc loc = heap_alloc(e, cls_fit(ar + 2));
-  for (u32 i = 0; rem && i < ar; i += 1) {
-    e.mem[loc + i] = TERM_HOLE;
-  }
   e.mem[loc + ar]     = cont;
   e.mem[loc + ar + 1] = ((u64)idx << 32) | rem;
   return loc;
@@ -4568,6 +4595,36 @@ static const WlFn wl_tab[] = { WL_TABLE };
 #undef WL_X
 #endif
 
+// WebGPU runs the segments in groups, a kernel each: a lane that jumps out
+// of its kernel's group parks, the words its fid takes, rn and seq on its
+// stack, and returns a PAK term of the fid and the stack's depth, which
+// the kernel whose group holds the fid takes on (wg_run).
+#if DEVICE && defined(WG_GROUPS)
+#define WL_LIVE(F) (fid_seqk(F) ? fid_resw(F) : fid_arity(F))
+#define WL_UNPARK \
+  Stk s0 = sp; \
+  if (term_tag(t) == TAG_PAK) { \
+    fid = (Fid)term_aux(t); \
+    sp += (term_loc(t) - 1) * LANE_STEP; \
+    rn  = (u32)STK(0); \
+    seq = (u32)(STK(0) >> 32); \
+    sp -= WL_LIVE(fid) * LANE_STEP; \
+    WL_UNSTOW(WL_LIVE(fid)) \
+  }
+#define WL_PARK \
+  if (fid < FID_EXIT) { \
+    u32 wn = WL_LIVE(fid); \
+    WL_ROOM(wn + 1) \
+    WL_STOW(wn) \
+    sp += (wn + 1) * LANE_STEP; \
+    STK(-1) = rn | (u64)seq << 32; \
+    return term_make(TAG_PAK, fid, (u32)(sp - s0) / (u32)CUBE); \
+  }
+#else
+#define WL_UNPARK
+#define WL_PARK
+#endif
+
 static Reply work_loop(Env e, Stk sp, Term t, u32 seq) {
   WL_BANK
   u32 rn = 0;
@@ -4575,6 +4632,7 @@ static Reply work_loop(Env e, Stk sp, Term t, u32 seq) {
 #if DEVICE
   Fid fid   = FID_ENTER;
   u32 wpoll = 0;
+  WL_UNPARK
   for (;;) {
   if (err_spun(e.mem, &wpoll)) {
     return 0;
@@ -4662,6 +4720,7 @@ static Reply work_loop(Env e, Stk sp, Term t, u32 seq) {
 
 #if DEVICE
   default: {
+    WL_PARK
     err_post(e.mem, ERR_FIDS);
     return 0;
   }
