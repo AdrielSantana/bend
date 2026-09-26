@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fly, automatic</title>
+<style>
+  body { margin: 16px; background: #111; color: #ccc; display: flex;
+    flex-direction: column; align-items: center; gap: 12px;
+    font: 14px/1.4 ui-monospace, monospace; }
+  canvas { max-width: 100%; image-rendering: pixelated; }
+  pre { margin: 0; white-space: pre-wrap; max-width: 100%; }
+  select { font: inherit; color: inherit; background: #222; border: 1px solid #444; }
+</style>
+<canvas id="bend"></canvas>
+<pre><select id="bend-on"></select> <span id="bend-rate"></span></pre>
+<pre id="bend-out"></pre>
+<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Fly, automatic</b>: Fly built by the compiler that cuts and splits by compile cost (it stays one kernel).<br>
+The selector under the picture runs the <code>!</code> on your GPU through WebGPU, or on a count of your CPU's threads.
+<a href="#" onclick="document.getElementById('bend').requestFullscreen(); return false">Fullscreen</a></p>
+<style>a { color: #8cf; }</style>
+<script>
+  var cores   = navigator.hardwareConcurrency;
+  var query   = new URLSearchParams(location.search);
+  var threads = Math.min(Number(query.get("threads")) || cores, cores);
+  var select  = document.getElementById("bend-on");
+  if (true) {
+    select.appendChild(new Option("WebGPU", 0));
+  }
+  for (var i = cores; i >= 1; i -= 1) {
+    select.appendChild(new Option(i + (i > 1 ? " CPU threads" : " CPU thread"), i));
+  }
+  select.value = true && query.get("gpu") !== "off" ? 0 : threads;
+  select.onchange = function() {
+    query.delete("gpu");
+    query.delete("threads");
+    if (select.value > 0) {
+      query.set("gpu", "off");
+      query.set("threads", select.value);
+    }
+    location.search = query;
+  };
+  var say = function(text) {
+    document.getElementById("bend-out").append(text + "\n");
+  };
+  var Module = {
+    arguments: ["--threads", String(threads)].concat(query.get("gpu")
+      ? ["--gpu", query.get("gpu")] : []),
+    print: say,
+    printErr: say,
+    onExit: function(code) {
+      say("exit " + code);
+      rate();
+    },
+  };
+  if (!crossOriginIsolated) {
+    say("no threads: the page needs the Cross-Origin-Opener-Policy: "
+      + "same-origin and Cross-Origin-Embedder-Policy: require-corp headers");
+  }
+  var frames = 0;
+  var rate = function() {
+    var n = Module.bendFrames | 0;
+    document.getElementById("bend-rate").textContent = [n > 0 ? n - frames
+      + " fps" : "", Module.bendRan === undefined ? "" : "ran "
+      + Module.bendRan.toFixed(1) + " ms", Module.bendOn].filter(Boolean)
+      .join(", ");
+    frames = n;
+  };
+  setInterval(rate, 1000);
+</script>
+<script src="../coi-serviceworker.js"></script>
+<script src="index.js"></script>
