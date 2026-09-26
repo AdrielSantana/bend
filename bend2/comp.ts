@@ -595,6 +595,10 @@ const FOLDS: Map<HTerm, HTerm | null> = new Map();
 
 const FLATS: Map<Bend.Name, boolean> = new Map();
 
+// The defs a page's WebGPU lane runs as tasks though they are flat, so no
+// kernel inlines them into every caller (wgsl.ts).
+const CUTS: Set<Bend.Name> = new Set();
+
 const SIGS: Map<Bend.Name, Sig> = new Map();
 
 const BRWS: Map<Bend.Name, boolean[]> = new Map();
@@ -1545,12 +1549,13 @@ function flat_call(c: Carb, t: HTerm): boolean {
   return ck !== null && ck.bang !== true && flat_of(ck.k);
 }
 
-// A def is flat when its source is and every def it calls is.
+// A def is flat when its source is, it is not cut, and every def it calls is.
 function flat_of(k: Bend.Name): boolean {
   return memo(FLATS, k, () => {
     const own = SRCS.get(k);
     FLATS.set(k, false);
-    return own !== undefined && own.flat && [...own.deps].every(flat_of);
+    return own !== undefined && own.flat && !CUTS.has(k)
+      && [...own.deps].every(flat_of);
   });
 }
 
@@ -2247,7 +2252,7 @@ function emit_native(fl: File, ck: Call, ers: HTerm[]): string {
   seg.fid = name;
   const dst = val_new(seg.ret.ks.map(() => name_local(fl, "v")), seg.ret);
   emit_body(fl, body_at(fl, ck.k, ers), tld.T, ers, vals, dst);
-  fl.spins.push([name, [`${seg.lines.length < SPIN_FAR ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
+  fl.spins.push([name, [`// ${ck.k}`, `${seg.lines.length < SPIN_FAR ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
     seg.ks.map((k, i) => `, ${lay_c(k)} r${i}`).join("")}) {`,
   ...seg.spin ? ["  u32 wpoll = 0;"] : [],
   ...dst.ws.map((v, j) => `  ${lay_c(seg.ret.ks[j])} ${v} = 0;`),
@@ -3042,7 +3047,10 @@ function compile_segs(fl: File): string {
   }).join("\n\n");
 }
 
-export function compile_book(book: Bend.Book): string {
+export function compile_book(book: Bend.Book, cuts = new Set<Bend.Name>())
+  : string {
+  CUTS.clear();
+  cuts.forEach((k) => CUTS.add(k));
   const cb = carb_book(book, ["main", ...RUNTIME_ADTS]);
   const show = show_main(book);
   const facts = () => cb.own.size + cb.hot.size + cb.stat.size;

@@ -3805,31 +3805,160 @@ static void gpu_pass(u32 f) {
 }
 `;
 
-// The run's groups, a kernel each: the fids of the names each of
-// WGSL_GROUPS's patterns (;-separated) matches, the last group those none
-// matches; the runtime's segments are in every group.
-function groups_of(c: string): Set<number>[] {
-  const pats = (process.env.WGSL_GROUPS ?? "").split(";").filter(Boolean)
-    .map((p) => new RegExp(p));
-  const gs = [...Array(Math.max(pats.length, 1))].map(() => new Set<number>());
-  for (const [, name, v] of c.matchAll(/^#define FID_(\w+) (\d+)$/gm)) {
-    const ks = ["ENTER", "EXIT", "CLO_APPLY", "IO_EMIT"].includes(name)
-      ? gs.map((_, k) => k) : pats.flatMap((p, k) => p.test(name) ? [k] : []);
-    (ks.length > 0 ? ks : [gs.length - 1]).forEach((k) => gs[k].add(Number(v)));
+// Groups
+// ======
+
+// A kernel's cost to compile: its lines once every call is inlined, and 30
+// more an atomic store. NVIDIA's compiler is superlinear in a kernel and
+// takes about 0.11 s a thousand lines and 3.7 s a thousand atomic stores (a
+// GTX 1650 Ti on Linux): Bendcraft's run took 93 s as one kernel with five
+// defs cut, and 15.6 s as six kernels of 47 to 82 thousand, 7 to 10 s each
+// alone. A def is cut when a fid's case is past ROOM; a cut call weighs
+// CUT_CALL (a task's frame, and a park when the callee's kernel is
+// another), so a small def called at every step stays inlined.
+const ROOM = 80000;
+const CUT_CALL = 1000;
+
+// The functions f calls, one a call site.
+function callees(fns: Map<string, string>, f: string): string[] {
+  const b = fns.get(f)!;
+  return [...b.slice(b.indexOf("{")).matchAll(/\b(\w+)\(/g)].map((m) => m[1])
+    .filter((g) => g !== f && fns.has(g));
+}
+
+function cost_of(fns: Map<string, string>): (f: string) => number {
+  const memo = new Map<string, number>();
+  const cost = (f: string): number => {
+    const b = fns.get(f)!;
+    const n = memo.get(f) ?? callees(fns, f).reduce((a, g) => a + cost(g),
+      b.split("\n").length + 30 * (b.match(/\batomic(?!Load)\w*\(/g)?.length
+        ?? 0));
+    memo.set(f, n);
+    return n;
+  };
+  return cost;
+}
+
+// Each fid's copy of wg_run with its case alone (st_switch), and the copy
+// with none: a case adds to a kernel what its copy costs past that one.
+type Cases = { fns: Map<string, string>; cost: (f: string) => number;
+  none: string; runs: Map<number, string> };
+
+function cases_of(ast: N, helpers: string, fids: number[], rt: number[])
+  : Cases {
+  const u = unit_new(ast);
+  const fns = new Map(helpers.split(/^(?=fn \w+\()/m).map((b)
+    : [string, string] => [/^fn (\w+)/.exec(b)?.[1] ?? "", b]));
+  const run = (pre: string, grp: number[]): string => {
+    const v: Unit = { ...u, pre, grp: new Set([...rt, ...grp]) };
+    const f = inst_of(v, "wg_run", []);
+    translated(v, fns);
+    return f;
+  };
+  const none = run("b_", []);
+  const runs = new Map(fids.map((k) => [k, run(`m${k}_`, [k])]));
+  return { fns, cost: cost_of(fns), none, runs };
+}
+
+// The def to cut in a case past ROOM: of the defs its spins run, the one
+// whose copies past the first save the most over their cut calls, else the
+// one that splits the case most evenly.
+function cut_of(cs: Cases, root: string, def: (f: string) => string | undefined)
+  : string | undefined {
+  const order: string[] = [];
+  const seen = new Set<string>();
+  const visit = (f: string): void => {
+    if (!seen.has(f)) {
+      seen.add(f);
+      callees(cs.fns, f).forEach(visit);
+      order.push(f);
+    }
+  };
+  visit(root);
+  const n = new Map([[root, 1]]);
+  order.reverse().forEach((f) => callees(cs.fns, f).forEach((g) =>
+    n.set(g, (n.get(g) ?? 0) + n.get(f)!)));
+  const ds = new Map<string, [number, number]>();
+  n.forEach((k, f) => {
+    const d = def(f);
+    if (d !== undefined) {
+      const [c, s] = ds.get(d) ?? [0, 0];
+      ds.set(d, [c + k, Math.max(s, cs.cost(f))]);
+    }
+  });
+  const all = cs.cost(root) - cs.cost(cs.none);
+  const best = (by: (x: [number, number]) => number): [string, number] =>
+    [...ds].reduce((a, [d, x]) => by(x) > a[1] ? [d, by(x)] : a, ["", 0]);
+  const gain = best(([c, s]) => (c - 1) * s - c * CUT_CALL);
+  const even = best(([c, s]) => Math.min(c * s, all - c * s) - c * CUT_CALL);
+  return (gain[1] > 0 ? gain : even)[0] || undefined;
+}
+
+// The run's groups, a kernel each: the fids in order, a group taking the
+// next case while it fits ROOM; the runtime's fids are in every group.
+function packed(cs: Cases, fids: number[], rt: number[]): Set<number>[] {
+  const gs = [new Set(rt)];
+  let used = 0;
+  for (const k of fids) {
+    const w = cs.cost(cs.runs.get(k)!) - cs.cost(cs.none);
+    if (w > 0 && used > 0 && cs.cost(cs.none) + used + w > ROOM) {
+      gs.push(new Set(rt));
+      used = 0;
+    }
+    gs[gs.length - 1].add(k);
+    used += w;
   }
   return gs;
+}
+
+// Do the helpers' u64 loads read the mirror: not in a program whose arrays
+// take atomics, whose changes the mirror never sees (HELPERS).
+function mirror(c: string): boolean {
+  return !/\ba32_\w+\(blk_ptr\(/.test(c);
 }
 
 // Export
 // ======
 
-// The page's lane for a program with `!`: the glue, with the WGSL and
-// TAB's words it hands the browser, written into dir, and its path, for
-// the template's BEND_WEBGPU.
-export function webgpu_page(c: string, dir: string, cc = "clang"): string {
-  const helpers = HELPERS(!/\ba32_\w+\(blk_ptr\(/.test(c));
-  const gs = groups_of(c);
-  const dev = device_of(ast_of(c, dir, cc, gs.length > 1), helpers, gs);
+// The page's lane for a program with `!`: its C, cut (recompiled without
+// fusing the defs cut_of names) until every fid's case fits ROOM, and the
+// glue, with the WGSL and TAB's words it hands the browser, written into
+// dir, for the template's BEND_WEBGPU.
+export function webgpu_page(c: string, dir: string, cc: string,
+  recompile: (cuts: Set<string>) => string): { c: string; glue: string } {
+  const cuts = new Set<string>();
+  for (;;) {
+    const fids = new Map([...c.matchAll(/^#define FID_(\w+) (\d+)$/gm)].map(
+      (m): [string, number] => [m[1], Number(m[2])]));
+    const host = [...c.matchAll(/^#if !DEVICE\n\s*WL_CASE\(FID_(\w+)\)/gm)]
+      .map((m) => m[1]);
+    const rt = ["ENTER", "EXIT", "CLO_APPLY", "IO_EMIT"];
+    const ks = [...fids].filter(([k]) => !host.includes(k) && !rt.includes(k))
+      .map(([, v]) => v);
+    const every = rt.map((k) => fids.get(k)!);
+    const spun = new Map([...c.matchAll(/^\/\/ (\S+)\n\w+ Term (spin_\d+)\(/gm)]
+      .map((m): [string, string] => [m[2], m[1]]));
+    const ast = ast_of(c, dir, cc, true);
+    const cs = cases_of(ast, HELPERS(mirror(c)), ks, every);
+    const more = ks.filter((k) => cs.cost(cs.runs.get(k)!) > ROOM).map((k) =>
+      cut_of(cs, cs.runs.get(k)!, (f) =>
+        spun.get(/^c_(spin_\d+)(_|$)/.exec(f)?.[1] ?? "")))
+      .filter((d): d is string => d !== undefined && !cuts.has(d));
+    if (more.length === 0) {
+      const gs = packed(cs, ks, every);
+      return { c, glue: glue_of(c, dir, gs.length > 1 ? ast
+        : ast_of(c, dir, cc, false), gs) };
+    }
+    more.forEach((d) => cuts.add(d));
+    c = recompile(cuts);
+  }
+}
+
+// The glue: GPU_SRC (what plan, pack and window reach), GPU_RUN (the run's
+// kernels) and GPU_D3D (the Direct3D copy), and TAB's words, and its path.
+function glue_of(c: string, dir: string, ast: N, gs: Set<number>[]): string {
+  const helpers = HELPERS(mirror(c));
+  const dev = device_of(ast, helpers, gs);
   const tab = dev.tab.length > 0 ? dev.tab : [0];
   const src = KERNELS(tab.length) + helpers + "\n" + dev.code;
   const glue = path.join(dir, "webgpu.c");
