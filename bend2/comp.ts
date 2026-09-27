@@ -4026,9 +4026,9 @@ INLINE Term rfc_seal(Env e, Term t) {
   return rfc_wrap(e, t, 1);
 }
 
-// A redirect cell holds its target's loc over a 24-bit count, which
-// changes by atomic adds on the low half: the cell is read as two atomic
-// halves, never as one plain word.
+// A redirect cell holds its target's loc over a 24-bit count, changed by
+// atomic adds on the low half: it is read as two atomic halves, but plainly
+// by a device peek, whose share pins the loc: a Metal atomic load is dear.
 INLINE u64 rfc_view(DEV u64* H, u64 r) {
   DEV u32* w = a32_at(H, r);
   u64 cell = ((u64)a32_load(w + 1) << 32) | a32_load(w);
@@ -4058,7 +4058,7 @@ INLINE Term term_keep(Env e, Term t, u32 k) {
 
 INLINE u64 term_peek(DEV u64* H, Term t) {
   if (term_rfc(t)) {
-    return rfc_view(H, term_loc(t)) >> 24;
+    return (DEVICE ? H[term_loc(t)] : rfc_view(H, term_loc(t))) >> 24;
   }
   return term_loc(t);
 }
