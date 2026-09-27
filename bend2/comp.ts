@@ -4612,7 +4612,10 @@ INLINE u32 monk_step(Env e, DEV Term* stk, u32 rg, u32 put0, u32 base, u32 strid
 // rd, CUBE_T entries a step (loads, barrier, stores: rd <= top), off the
 // host's pages. A grow pass ends when its group is full or nothing grew,
 // so a spine of forks unrolls whole. TG_HOLD words of threadgroup memory
-// hold one group per Apple core (bitonic 1.35x without).
+// hold one group per Apple core (bitonic 1.35x without). Pass 3, the
+// work after a grow, drains the lane's own ring, not the deals' flip, to
+// the put the grow left: a SIMD group runs neighbours, and a late group
+// leaves this pass's deals to the next round.
 
 #if DEVICE
 
@@ -4674,7 +4677,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
   }
   u32  stride = grids == 1 ? CUBE_G : 1;
   u32  me     = row * CUBE_T + stride * lane;
-  u32 rg     = pass ? ring_flip(me) : me;
+  u32 rg     = pass == 1 ? ring_flip(me) : me;
   Env  e      = { H, H + ALC_OFF + me };
   DEV Term*  stk    = (DEV Term*)(H + STAK_OFF + me);
   if (lane == 0) {
@@ -4683,7 +4686,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
     }
   }
   BAR();
-  u32 put0      = a32_load(ring_put(H, rg));
+  u32 put0      = a32_load(ring_put(H, rg) + (pass == 3));
   u32 seen_has  = 0;
   u32 seen_grew = 0;
   for (;;) {
@@ -4719,6 +4722,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
       seen_grew = grew;
     }
   }
+  a32_store(ring_put(H, rg) + 1, a32_load(ring_put(H, rg)));
   dev_cut(e);
 }
 
@@ -4951,7 +4955,7 @@ static void gpu_run(u32 f) {
   if (f < LANES) {
     gpu_kernel(0, CUBE_G);
   }
-  gpu_kernel(1, CUBE_G);
+  gpu_kernel(f < LANES ? 3 : 1, CUBE_G);
   gpu_kernel(2, 1);
 }
 
