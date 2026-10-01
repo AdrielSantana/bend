@@ -3818,6 +3818,12 @@ static void gpu_pass(u32 f) {
 // another), so a small def called at every step stays inlined.
 const ROOM = 80000;
 const CUT_CALL = 1000;
+// A cycle of fids may take a kernel past ROOM, up to LOOP, since split it
+// pays a round a turn: Slash Boss's Blend.go, 104 thousand with the base,
+// read 10 fps at 40 rounds a frame in one kernel and 5 at 168 in two, on
+// the notebook's Direct3D; Bendcraft's kernels at 110 thousand read 38 ms
+// a frame there against 27 at 80.
+const LOOP = 120000;
 
 // The functions f calls, one a call site.
 function callees(fns: Map<string, string>, f: string): string[] {
@@ -3894,20 +3900,88 @@ function cut_of(cs: Cases, root: string, def: (f: string) => string | undefined)
   return (gain[1] > 0 ? gain : even)[0] || undefined;
 }
 
-// The run's groups, a kernel each: the fids in order, a group taking the
-// next case while it fits ROOM; the runtime's fids are in every group.
-function packed(cs: Cases, fids: number[], rt: number[]): Set<number>[] {
+// The device's fids in the order a lane meets them: a fid, then the other
+// defs its case jumps to or forks, then its own def's fids (a segment's fid
+// is its def's and _K, _J or _C and a number), the continuations that run
+// once those return. A round dispatches the kernels in this order, so a
+// lane that leaves a kernel for a later one runs on in the same round, and
+// only a jump back waits for the next: a loop pays a round a turn unless
+// it lies in one kernel, so the fids of a cycle of jumps and returns come
+// as one unit, at its first fid. It starts at the defs no other def calls,
+// the entries of the bangs.
+function flow_of(c: string, fids: [string, number][]): number[][] {
+  const body = new Map(c.split(/^ {2}WL_CASE\(FID_/m).slice(1).map((b) =>
+    [/^\w+/.exec(b)![0], b.slice(0, b.indexOf("\n  }}"))]));
+  const id = new Map(fids);
+  const refs = (n: string, re: RegExp): string[] => [...body.get(n)!
+    .matchAll(re)].map((m) => m[1]).filter((r) => id.has(r));
+  const stem = (n: string): string => n.replace(/_[KJC]\d+$/, "");
+  const own = (n: string): string[] => refs(n, /\bFID_(\w+)/g)
+    .filter((r) => r !== n && stem(r) === stem(n));
+  const calls = (n: string): string[] => refs(n, /\bFID_(\w+)/g)
+    .filter((r) => stem(r) !== stem(n));
+  const next = new Map(fids.map(([n]) => [n, new Set(own(n))]));
+  fids.forEach(([n]) => refs(n, /WL_JMP\(FID_(\w+)\)/g).forEach((x) => {
+    next.get(n)!.add(x);
+    own(n).forEach((k) => next.get(x)!.add(k));
+  }));
+  const reach = (n: string): Set<string> => {
+    const s = new Set<string>();
+    const go = (m: string): void => next.get(m)!.forEach((x) => {
+      if (!s.has(x)) {
+        s.add(x);
+        go(x);
+      }
+    });
+    go(n);
+    return s;
+  };
+  const rs = new Map(fids.map(([n]) => [n, reach(n)]));
+  const met = new Set(fids.flatMap(([n]) => calls(n)));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const visit = (n: string): void => {
+    if (!seen.has(n)) {
+      seen.add(n);
+      out.push(n);
+      calls(n).forEach(visit);
+      own(n).forEach(visit);
+    }
+  };
+  [...fids].reverse().filter(([n]) => n === stem(n) && !met.has(n))
+    .forEach(([n]) => visit(n));
+  [...fids].reverse().forEach(([n]) => visit(n));
+  const done = new Set<string>();
+  return out.filter((n) => !done.has(n)).map((n) => out.filter((m) =>
+    !done.has(m) && (m === n || rs.get(n)!.has(m) && rs.get(m)!.has(n)))
+    .map((m) => {
+      done.add(m);
+      return id.get(m)!;
+    }));
+}
+
+// The run's groups, a kernel each: the units in flow order, a group taking
+// the next while it fits ROOM (a cycle LOOP), a unit past it a fid at a
+// time; the runtime's fids are in every group.
+function packed(cs: Cases, units: number[][], rt: number[]): Set<number>[] {
+  const none = cs.cost(cs.none);
+  const w = (k: number): number => cs.cost(cs.runs.get(k)!) - none;
   const gs = [new Set(rt)];
   let used = 0;
-  for (const k of fids) {
-    const w = cs.cost(cs.runs.get(k)!) - cs.cost(cs.none);
-    if (w > 0 && used > 0 && cs.cost(cs.none) + used + w > ROOM) {
+  const put = (ks: number[], room: number): void => {
+    const x = ks.reduce((a, k) => a + w(k), 0);
+    if (x > 0 && used > 0 && none + used + x > room) {
       gs.push(new Set(rt));
       used = 0;
     }
-    gs[gs.length - 1].add(k);
-    used += w;
-  }
+    ks.forEach((k) => gs[gs.length - 1].add(k));
+    used += x;
+  };
+  units.forEach((u) => {
+    const room = u.length > 1 ? LOOP : ROOM;
+    none + u.reduce((a, k) => a + w(k), 0) <= room ? put(u, room)
+      : u.forEach((k) => put([k], ROOM));
+  });
   return gs;
 }
 
@@ -3933,8 +4007,8 @@ export function webgpu_page(c: string, dir: string, cc: string,
     const host = [...c.matchAll(/^#if !DEVICE\n\s*WL_CASE\(FID_(\w+)\)/gm)]
       .map((m) => m[1]);
     const rt = ["ENTER", "EXIT", "CLO_APPLY", "IO_EMIT"];
-    const ks = [...fids].filter(([k]) => !host.includes(k) && !rt.includes(k))
-      .map(([, v]) => v);
+    const dev = [...fids].filter(([k]) => !host.includes(k) && !rt.includes(k));
+    const ks = dev.map(([, v]) => v);
     const every = rt.map((k) => fids.get(k)!);
     const spun = new Map([...c.matchAll(/^\/\/ (\S+)\n\w+ Term (spin_\d+)\(/gm)]
       .map((m): [string, string] => [m[2], m[1]]));
@@ -3945,7 +4019,7 @@ export function webgpu_page(c: string, dir: string, cc: string,
         spun.get(/^c_(spin_\d+)(_|$)/.exec(f)?.[1] ?? "")))
       .filter((d): d is string => d !== undefined && !cuts.has(d));
     if (more.length === 0) {
-      const gs = packed(cs, ks, every);
+      const gs = packed(cs, flow_of(c, dev), every);
       return { c, glue: glue_of(c, dir, gs.length > 1 ? ast
         : ast_of(c, dir, cc, false), gs) };
     }
