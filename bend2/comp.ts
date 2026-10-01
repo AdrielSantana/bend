@@ -3007,33 +3007,43 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     `static const u32 BANG_BRW[] = { ${[...brw, 0].join(", ")} };`,
     "#endif");
   defs.push(`#define STAT_LEN ${fl.img.length}`, "");
-  // One bank for both lanes, as wide as the widest segment or return; rp
-  // pads the host's twelfth slot so rax stays free for the tail call.
-  const resw = Math.max(...entries.map((s) => s.ret.ks.length));
-  const n = Math.max(resw, ...entries.filter((s) => s.frame === null)
-    .map((s) => s.params.length));
-  const rs = [...Array(n).keys()].map((i) => "r" + i);
-  const ws = n > 6 ? [...rs.slice(0, 6), "rp", ...rs.slice(6)] : rs;
-  // a ladder: a fallthrough switch's phi cascade costs clang O(n^2) to build
-  const ladder = (f: (r: string, i: number) => string): string =>
-    `  do { \\\n${rs.map((r, i) => `    if ((N) <= ${i}) break; ${f(r, i)}; \\\n`)
-      .join("")}  } while (0);`;
-  const last = rs.map((r, i) =>
-    `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
-  defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
-  `#define WL_BANK Term ${ws.join(", ")};`, "",
-  `#define WL_LOAD(A, N) \\\n${ladder((r, i) => `${r} = e.mem[(A) + ${i}]`)}`,
-  "", `#define WL_STOW(N) \\\n${ladder((r, i) => `STK(${i}) = ${r}`)}`, "",
-  `#define WL_UNSTOW(N) \\\n${ladder((r, i) => `${r} = STK(${i})`)}`, "",
-  `#define WL_LAST(X) \\\n  switch (war) { \\\n${last}  }`, "",
-  `#define WL_SAVE(V) ${rs.slice(0, resw).map((r, j) =>
-    `(V)[${j}] = ${r};`).join(" ")}`, "",
-  `#define WL_TAKE(V) ${rs.slice(0, resw).map((r, j) =>
-    `${r} = (V)[${j}];`).join(" ")}`, "",
-  `#define WL_SIG Corpus e_mem, DEV u64* e_alc, Stk sp, u32 seq, u32 rn, ${ws
-    .map((w) => "Term " + w).join(", ")}`, "",
-  `#define WL_ALL e.mem, e.alc, sp, seq, rn, ${ws.join(", ")}`, "",
-  `#define WL_TABLE ${entries.map((s) => `WL_X(${s.fid})`).join(" ")}`
+  // A bank a side, as wide as the side's widest segment or return: the
+  // device runs only what the bangs reach, and every word of the bank is a
+  // local of its work loop and a step of its ladders. rp pads the host's
+  // twelfth slot so rax stays free for the tail call. WL_RESW, the widest
+  // return of all, is the root's room in the header.
+  const bank = (es: Seg[]): string[] => {
+    const resw = Math.max(...es.map((s) => s.ret.ks.length));
+    const n = Math.max(resw, ...es.filter((s) => s.frame === null)
+      .map((s) => s.params.length));
+    const rs = [...Array(n).keys()].map((i) => "r" + i);
+    const ws = n > 6 ? [...rs.slice(0, 6), "rp", ...rs.slice(6)] : rs;
+    // a ladder: a fallthrough switch's phi cascade costs clang O(n^2) to build
+    const ladder = (f: (r: string, i: number) => string): string =>
+      `  do { \\\n${rs.map((r, i) =>
+        `    if ((N) <= ${i}) break; ${f(r, i)}; \\\n`).join("")
+      }  } while (0);`;
+    const last = rs.map((r, i) =>
+      `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
+    return [`#define WL_RETW ${resw}`, `#define WL_BANK Term ${ws.join(", ")};`,
+      `#define WL_LOAD(A, N) \\\n${ladder((r, i) =>
+        `${r} = e.mem[(A) + ${i}]`)}`,
+      `#define WL_STOW(N) \\\n${ladder((r, i) => `STK(${i}) = ${r}`)}`,
+      `#define WL_UNSTOW(N) \\\n${ladder((r, i) => `${r} = STK(${i})`)}`,
+      `#define WL_LAST(X) \\\n  switch (war) { \\\n${last}  }`,
+      `#define WL_SAVE(V) ${rs.slice(0, resw).map((r, j) =>
+        `(V)[${j}] = ${r};`).join(" ")}`,
+      `#define WL_TAKE(V) ${rs.slice(0, resw).map((r, j) =>
+        `${r} = (V)[${j}];`).join(" ")}`,
+      `#define WL_SIG Corpus e_mem, DEV u64* e_alc, Stk sp, u32 seq, u32 rn, ${
+        ws.map((w) => "Term " + w).join(", ")}`,
+      `#define WL_ALL e.mem, e.alc, sp, seq, rn, ${ws.join(", ")}`];
+  };
+  defs.push(`#define WL_RESW ${Math.max(...entries.map((s) =>
+    s.ret.ks.length))}`, `#define BANGS   ${fl.bangs.size}`, "", "#if DEVICE",
+    ...bank(entries.filter((s) => !s.host)), "#else", ...bank(entries),
+    "#endif", "",
+    `#define WL_TABLE ${entries.map((s) => `WL_X(${s.fid})`).join(" ")}`
     + " WL_X(FID_EXIT)");
   return defs;
 }
@@ -4537,7 +4547,7 @@ INLINE Loc task_tail(Term t) {
 
 INLINE Term task_deliver(Corpus H, Term cont, u32 idx, THR Term* v, u32 n) {
   Loc at = cont == TERM_HOLE ? H_ROOT_WORD : term_loc(cont) + idx;
-  for (u32 j = 0; j < WL_RESW; j += 1) {
+  for (u32 j = 0; j < WL_RETW; j += 1) {
     if (j < n) {
       H[at + j] = v[j];
     }
@@ -4719,7 +4729,7 @@ static Reply work_loop(Env e, Stk sp, Term t, u32 seq) {
   WL_CASE(FID_EXIT)
   {
     u32  n = rn;
-    Term rv[WL_RESW];
+    Term rv[WL_RETW];
     WL_SAVE(rv)
     WL_OPEN
     if (err_seen(e.mem)) {
@@ -5545,7 +5555,7 @@ static Corpus corpus_setup(bool gpu, long threads, u64 bytes) {
 
 OUTLINE Term corpus_eval(Corpus H, Term t) {
   Env  e = { H, ALC[0] };
-  Term rv[WL_RESW];
+  Term rv[WL_RETW];
   for (;;) {
     Reply r = work_loop(e, io_stk, t, !BANGS && pool_size == 1);
     if (r == 0) {

@@ -410,7 +410,7 @@ static void wg_roots(Corpus H) {
   u32 n = 0;
   a32_store(a32_at(H, WG_PACK), 1);
   H[WG_PR0] = HEAP_OFF + ((Loc)a32_load(a32_at(H, H_BUMP)) << PAGE_BITS);
-  for (u32 j = 0; j < WL_RESW && j + 1 < a32_load(a32_at(H, H_ROOT_DONE)); j += 1) {
+  for (u32 j = 0; j < WL_RETW && j + 1 < a32_load(a32_at(H, H_ROOT_DONE)); j += 1) {
     Loc w = H_ROOT_WORD + j;
     if (!term_triv(H[w])) {
       wg_push(H, (w << 32) | w, n);
