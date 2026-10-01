@@ -3622,6 +3622,7 @@ typedef u32 Err;
 #define ERR_RFCS 6
 #define ERR_DEEP 7
 #define ERR_ARRS 8
+#define ERR_FUEL 9
 
 typedef u32 Ring;
 
@@ -3909,7 +3910,21 @@ static void err_trap(int sig) {
 #endif
 
 #define err_seen(H)    (DEVICE && a32_load(a32_at(H, H_ERROR_CODE)) != 0)
-#define err_spun(H, n) ((++*(n) & 4095) == 0 && err_seen(H))
+
+// A loop's poll at its n-th turn: is the bang over? On a page a loop past
+// WG_FUEL turns fails it, since a dispatch that does not end holds the GPU
+// (bend2/wgsl.ts).
+#if DEVICE && defined(WG_FUEL)
+INLINE bool err_fuel(Corpus H, u32 n) {
+  if (n >= WG_FUEL) {
+    err_post(H, ERR_FUEL);
+  }
+  return err_seen(H);
+}
+#else
+#define err_fuel(H, n) err_seen(H)
+#endif
+#define err_spun(H, n) ((++*(n) & 4095) == 0 && err_fuel(H, *(n)))
 
 ${NATIVE.C}
 A32_LOOP(fadd, f32_rewrap(f32_unbox(o) + f32_unbox(v)))

@@ -139,25 +139,22 @@ const PRELUDE = [
   "void __threadfence(void);",
   "void __syncthreads(void);",
   "int __clz(int);",
-  "unsigned __steps(void);",
   ...MATH1.map((m) => `float ${m}(float);`),
   ...MATH2.map((m) => `float ${m}(float, float);`),
 ].join("\n") + "\n";
 
-// The loop turns a lane may take in one dispatch, over all its loops: past
-// them every loop it meets leaves at once and the bang fails (ERRS[9] in
-// comp.ts). A dispatch that does not end holds the GPU and the screen with
-// it: Slash Boss split in kernels held a Mac's until its window server's
+// The turns a loop of a page's shader may take: past them its lane posts
+// the ninth error (ERRS[9] in comp.ts), and every loop leaves at its next
+// poll. A dispatch that does not end holds the GPU and the screen with it:
+// Slash Boss split in kernels held a Mac's until its window server's
 // watchdog ended the session (2026-10-01). WGSL has no recursion, so a
-// shader whose every loop counts its turns ends. A lane takes a new task
-// only under a sixteenth of them (WG_TIRED), the rest left to the next
-// round, so a task has the other fifteen: a lane ahead of the others takes
-// task after task (eighteen of 3000 turns each on SwiftShader, which runs
-// few lanes at a time). Every lane out of fuel at once is the longest a
-// dispatch lasts, not yet measured on a GPU: 16384 lanes of 2^18 turns are
-// some 2 s if a GTX 1650 Ti takes 2.4 thousand million turns a second, as
-// Bendcraft's 27 ms a frame there say at 250 turns a pixel, a guess; 2^20
-// would be 7 s. Bendcraft's lanes peak at 45 thousand turns on SwiftShader.
+// shader whose every loop is bounded ends: 16384 lanes each in a loop
+// without end fail their bang in 20 ms on an M5. A loop counts its own
+// turns in a local and polls every 4096 (err_fuel, at err_spun's poll where
+// the C has one), so the bound is a loop's, and a loop in a loop may take
+// their product. A count a lane, a private word that every function then
+// carries, cost Bendcraft's frame a fifth on Metal: 39 to 47 ms at 1470x796
+// counted at the polls, 50 counted every turn.
 const FUEL = 1 << 18;
 
 // The rounds' words in the header's first line, which the host's runtime
@@ -185,7 +182,6 @@ const WG_DEFS = `
 #define WG_BLK   (1ull << 63)
 #define WG_LOCS  0x7FFFFFFFull
 #define WG_QCAP  (65535u * 64u)
-#define WG_TIRED ${FUEL >> 4}u
 #define WG_PARK  RING_OFF
 #define WG_PARKED (RING_OFF + LANES)
 #define WG_WANT  (RING_OFF + LANES + 1)
@@ -517,8 +513,8 @@ static bool wg_mine(Fid fid) {
 }
 
 // A lane parked on a fid of this kernel's group runs on, and an idle one
-// takes the tasks nobody took while it is not tired, until one parks; one
-// call of wg_task, since every call inlines the work loop.
+// takes the tasks nobody took, until one parks; one call of wg_task, since
+// every call inlines the work loop.
 static void wg_run(Corpus H, u32 i) {
   if (!wg_takes(H, i, false)) {
     return;
@@ -537,9 +533,6 @@ static void wg_run(Corpus H, u32 i) {
   }
   while (*pk == 0 && !err_seen(H)) {
     if (t == 0) {
-      if (__steps() >= WG_TIRED) {
-        return;
-      }
       u32 j = a32_add(a32_at(H, WG_GRAB), 1);
       if (j >= n) {
         return;
@@ -609,7 +602,7 @@ function ast_of(c: string, dir: string, cc: string, groups: boolean): N {
     }
     return r.stdout;
   };
-  run(["-E", "-P", "-D__CUDACC_RTC__", "-DCUBE_LOG=7",
+  run(["-E", "-P", "-D__CUDACC_RTC__", "-DCUBE_LOG=7", `-DWG_FUEL=${FUEL}u`,
     ...groups ? ["-DWG_GROUPS"] : [], "-x", "c", src, "-o", pre]);
   const ls = fs.readFileSync(pre, "utf8").split("\n");
   const keep: string[] = [];
@@ -1661,9 +1654,6 @@ function ex_call(f: Fn, n: N, t: Ty): Val {
   if (name === "__clz") {
     return { s: `countLeadingZeros(${val(vs[0])})`, t };
   }
-  if (name === "__steps") {
-    return { s: "STEPS", t };
-  }
   if (MATH1.includes(name) || MATH2.includes(name)) {
     const w = { fabs: "abs", log10: "c_log10", pow: "c_pow", atan2: "c_atan2",
       fmod: "c_fmod" }[name] ?? name;
@@ -1866,8 +1856,7 @@ function st_loop(f: Fn, init: N | undefined, c: N | undefined,
     if (k === 0n) {
       return;
     }
-    nest(f, "loop {", () => {
-      fuel(f);
+    fueled(f, b, () => {
       if (k === null) {
         nest(f, `if (!(${cond(ex(f, c!))})) {`, () => emit(f, "break;"));
       }
@@ -1881,19 +1870,39 @@ function st_loop(f: Fn, init: N | undefined, c: N | undefined,
 
 function st_do(f: Fn, b: N, c: N): void {
   const k = fold(f.u, c);
-  nest(f, "loop {", () => {
-    fuel(f);
+  const turn = (): void => {
     nest(f, "{", () => body(f, b));
     if (k === null || k === 0n) {
       nest(f, "continuing {", () => emit(f, `break if !(${k === 0n ? "false"
         : cond(ex(f, c))});`));
     }
-  });
+  };
+  k === 0n ? nest(f, "loop {", turn) : fueled(f, b, turn);
 }
 
-// A loop leaves once its lane is out of fuel (see FUEL).
-function fuel(f: Fn): void {
-  nest(f, "if (spent()) {", () => emit(f, "break;"));
+// Does a loop's body poll (err_spun) in its own statements, not in a loop
+// inside it?
+function polls(n: N): boolean {
+  return n.kind === "CallExpr" ? callee(n) === "err_fuel"
+    : !["ForStmt", "WhileStmt", "DoStmt"].includes(n.kind)
+      && (n.inner ?? []).some(polls);
+}
+
+// A loop that does not poll counts its turns and polls every 4096, leaving
+// once the bang is over (see FUEL); C's do ... while (0) is no loop.
+function fueled(f: Fn, b: N, turn: () => void): void {
+  if (polls(b)) {
+    return nest(f, "loop {", turn);
+  }
+  const k = name_new(f, "turns");
+  const out = inst_of(f.u, "err_fuel", [undefined, undefined]);
+  emit(f, `var ${k}: u32 = 0u;`);
+  nest(f, "loop {", () => {
+    emit(f, `${k} += 1u;`);
+    nest(f, `if ((${k} & 4095u) == 0u && ${out}(0u, ${k})) {`, () =>
+      emit(f, "break;"));
+    turn();
+  });
 }
 
 // A switch: labels grouped, and a group that can fall through runs the
@@ -2096,6 +2105,7 @@ function device_of(ast: N, helpers: string, gs: Set<number>[])
   const u = unit_new(ast);
   ["wg_plan", "wg_packs", "wg_window"].forEach((f) =>
     inst_of(u, f, []));
+  inst_of(u, "err_fuel", [undefined, undefined]);
   const fns = translated(u);
   const text = (pre: string, runs: (v: Unit) => Unit[]): string => {
     const v: Unit = { ...u, done: new Map(u.done), todo: [],
@@ -2268,8 +2278,10 @@ function fn_merged(u: Unit, inst: string, to: Set<string>): string {
     : " -> " + ty_wgsl(f.ret)} {`, ...copies,
     ...[...g.vars, ...mx.vars].map(([n, t]) => `  var ${n}: ${t};`),
     "  var pc = 1u;",
+    "  var turns = 0u;",
     "  loop {",
-    "    if (spent()) {",
+    "    turns += 1u;",
+    "    if ((turns & 4095u) == 0u && c_err_fuel(0u, turns)) {",
     `      return${f.ret.k === "void" ? "" : " " + zero(f.ret)};`,
     "    }",
     ...pick(mx.sts, "    "),
@@ -2401,8 +2413,10 @@ function run_d3d(u: Unit, helpers: string, fns: Map<string, string>)
   return code(fr.decls, [...fr.locals,
     ...pin.map(([x, v]) => `  ${fr.at(x)} = ${v};`),
     `  var pc = ${w.entry}u;`,
+    "  var turns = 0u;",
     "  loop {",
-    "    if (pc == 0u || spent()) {",
+    "    turns += 1u;",
+    "    if (pc == 0u || ((turns & 4095u) == 0u && c_err_fuel(0u, turns))) {",
     "      break;",
     "    }",
     ...pick(mx.sts, "    "),
@@ -2868,16 +2882,6 @@ function part_loop(mx: Mx, s: Blk, cx: Cx, c: Cur)
 // the corpus.
 const HELPERS = (mirror: boolean) => String.raw`
 var<private> NZ: u32;
-var<private> STEPS: u32;
-
-fn spent() -> bool {
-  if (STEPS < ${FUEL}u) {
-    STEPS += 1u;
-    return false;
-  }
-  c_err_post(0u, 9u);
-  return true;
-}
 
 fn ld64(i: u32) -> vec2<u32> {
   return ${mirror ? "vec2<u32>(P[i], P[i + 1u])"
@@ -2895,8 +2899,10 @@ fn st64(i: u32, v: vec2<u32>) {
 }
 
 fn c_cas(i: u32, x: u32, v: u32) -> u32 {
+  var turns = 0u;
   loop {
-    if (spent()) {
+    turns += 1u;
+    if ((turns & 4095u) == 0u && c_err_fuel(0u, turns)) {
       return ~x;
     }
     let r = atomicCompareExchangeWeak(&M[i], x, v);
