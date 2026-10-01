@@ -174,7 +174,8 @@ const WIDE = 255;
 const ERRS = ("|*|*|out of memory: run again with a bigger span, as in"
   + " --gpu 8GB|a function the device does not hold|a Nat past the"
   + " largest immediate 2^48-1|*|memory fault (machine stack overflow?)|an"
-  + " array past the deepest block class 31").split("|")
+  + " array past the deepest block class 31|a lane past the loop turns a"
+  + " page's dispatch may take").split("|")
   .map((e) => e === "*" ? "runtime fail-stop" : e);
 
 // Operations
