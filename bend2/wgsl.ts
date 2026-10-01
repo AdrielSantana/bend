@@ -3186,6 +3186,11 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
     var runs = text.match(/fn run_[a-z0-9]+/g).map(function(f) {
       return f.slice(3);
     });
+    // A workgroup's lanes, 64 unless the URL says (?wg=32, 128 or 256):
+    // which a device runs best is for a run on it to tell.
+    var url = new URLSearchParams(location.search);
+    var wg = [32, 128, 256].indexOf(Number(url.get("wg"))) < 0 ? 64
+      : Number(url.get("wg"));
     // A laptop with two GPUs hands out its integrated one by default, the
     // one that also draws the screen; a software adapter (SwiftShader, let
     // through by a flag) runs the rounds on the CPU, slower than the cores.
@@ -3198,7 +3203,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
     var dev = await ad.requestDevice({ requiredLimits: {
       maxBufferSize: L.maxBufferSize,
       maxStorageBufferBindingSize: L.maxStorageBufferBindingSize } });
-    var G = { dev: dev, bad: null, ks: {}, ords: {} };
+    var G = { dev: dev, bad: null, ks: {}, ords: {}, stat: [0, 0, 0] };
     dev.addEventListener("uncapturederror", function(ev) {
       G.bad = G.bad || ev.error.message;
       console.error("bend: WebGPU: " + ev.error.message);
@@ -3263,16 +3268,17 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
       var pass = enc.beginComputePass();
       pass.setPipeline(G.win);
       pass.setBindGroup(0, G.g0);
-      pass.dispatchWorkgroups(Math.ceil((a & 0xFFFF) * (a >>> 16) / 64));
+      pass.dispatchWorkgroups(Math.ceil((a & 0xFFFF) * (a >>> 16) / wg));
       pass.end();
       return enc;
     };
     G.pix = pix * 8;
-    G.groups = groups;
+    G.groups = groups * 64 / wg;
     // Direct3D takes seconds to minutes to compile a program's shader, off
-    // the page's thread: the program waits a second for it, then starts
-    // with its ! on the cores, and the ! moves to the GPU when its pipelines
-    // are ready (gpu_ready), the status line counting the seconds.
+    // the page's thread: the program waits a second for it (or the URL's
+    // ?grace= milliseconds: a run that measures the GPU waits it out), then
+    // starts with its ! on the cores, and the ! moves to the GPU when its
+    // pipelines are ready (gpu_ready), the status line counting the seconds.
     var t0 = performance.now();
     var secs = function() {
       return ((performance.now() - t0) / 1000).toFixed(1) + " s";
@@ -3289,7 +3295,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
       Atomics.store(HEAP32, ready >> 2, v);
     };
     var compiled = (async function() {
-      var mod = dev.createShaderModule({ code: UTF8ToString(src) + text });
+      var mod = dev.createShaderModule({ code: (UTF8ToString(src) + text)
+        .split("workgroup_size(64)").join("workgroup_size(" + wg + ")") });
       var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
         return m.type === "error";
       });
@@ -3325,7 +3332,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
       });
     });
     await Promise.race([compiled, new Promise(function(r) {
-      setTimeout(r, 1000);
+      setTimeout(r, Number(url.get("grace")) || 1000);
     })]);
     await dev.queue.onSubmittedWorkDone();
     Module.bendGpu = G;
@@ -3343,6 +3350,8 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
 // a slot a kid, and the later ones keep the order of the fastest. A heap
 // past three quarters of its cap between two submits grows fourfold, the
 // whole corpus carried over (G.make), and the device's cap with it.
+// G.stat counts the bangs, their rounds and their milliseconds, for a page
+// that measures.
 EM_JS(void, webgpu_js_run, (GpuReq* q), {
   var G = Module.bendGpu;
   var w = function(k) { return HEAPU32[(q >> 2) + k]; };
@@ -3397,8 +3406,10 @@ EM_JS(void, webgpu_js_run, (GpuReq* q), {
       var cap = h[2];
       G.head.unmap();
       if (stop) {
+        var ms = performance.now() - t0;
         G.ks[w(18)] = Math.min(used, 256);
-        o.t[ord] = Math.min(o.t[ord], performance.now() - t0);
+        G.stat = [G.stat[0] + 1, G.stat[1] + used, G.stat[2] + ms];
+        o.t[ord] = Math.min(o.t[ord], ms);
         o.n += 1;
         return end(1);
       }
