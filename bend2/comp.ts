@@ -2301,6 +2301,28 @@ function emit_open(fl: File, k: Name): [File, Val[]] {
   return [{ ...fl, seg, spares: [], uses: new Map(), def: k }, vals];
 }
 
+// whether every box of A's layout is an Array, which holds no subterm
+function ty_flat(book: Bend.Book, A: HTerm | null): boolean {
+  const t = ty_adt(book, A);
+  const lay = lay_of(book, A);
+  const tld = t === null ? undefined : book.tlds[t.k];
+  return !lay.ks.includes("box") || t?.k === "Array" || lay !== BOX
+    && tld?.$ === "ADT" && tld.c.every((c) =>
+      ctr_doms(book, c, t!.x).every((F) => ty_flat(book, F)));
+}
+
+// A loop of a checked def whose one Nat is all it can descend on (the
+// rest flat) ends within that Nat's turns: it reads the error word once,
+// on entry. A loop over a structure polls every turn, since a lane out
+// of heap builds cycles at HEAP_OFF.
+function nat_bound(fl: File, k: Name): boolean {
+  const { live, lays } = fun_of(fl, k);
+  const tld = fl.book.tlds[k];
+  return tld?.$ === "Def" && tld.u !== true
+    && lays.flatMap((l) => l.ks).filter((x) => x === "w64").length === 1
+    && live.every(([, , A]) => ty_flat(fl.book, A));
+}
+
 function emit_native(fl: File, k: Name, ers: HTerm[]): string {
   const key = [k, ...ers.map((e) => JSON.stringify(lay_of(fl.book, e)))]
     .join("|");
@@ -2317,15 +2339,17 @@ function emit_native(fl: File, k: Name, ers: HTerm[]): string {
   const dst = val_new(seg.ret.ks.map(() => name_local(fl, "v")), seg.ret);
   emit_body(sl, fun_of(fl, k).h!, fl.book.tlds[k].T, ers, vals, dst);
   FUEL = fuel;
+  const bound = seg.spin === true && nat_bound(fl, k);
   fl.spins.push({ ...seg, lines: [`${seg.lines.length < SPIN_FAR
     ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
     seg.ks.map((k, i) => `, ${lay_c(k)} r${i}${arr_q(fl, k)
       ? `, u64 q${i}` : ""}`).join("")}) {`,
-  "  u32 wpoll = 0;", ...seg.ks.flatMap((k, i) =>
+  ...bound ? [] : ["  u32 wpoll = 0;"], ...seg.ks.flatMap((k, i) =>
     arr_q(fl, k) ? [`  Term h${i} = r${i};`] : []),
   ...dst.ws.map((v, j) => `  ${lay_c(seg.ret.ks[j])} ${v} = 0;`),
   ...seg_take(seg).map((l) => "  " + l),
-  "  WL_SPIN", ...seg_text(seg.lines, 2), "  break;", "  }",
+  bound ? "  WL_LOOP" : "  WL_SPIN", ...seg_text(seg.lines, 2), "  break;",
+  "  }",
   ...dst.ws.map((v, j) => `  o[${j}] = ${v};`),
   "  return 1;", "}"] });
   return name;
@@ -3549,6 +3573,7 @@ using namespace metal;
 #define WL_DYN(F)  __attribute__((musttail)) return wl_tab[F](WL_ALL)
 #endif
 #define WL_SPIN     for (;;) { if (err_spun(e.mem, &wpoll)) { return 0; }
+#define WL_LOOP     if (err_seen(e.mem)) { return 0; } for (;;) {
 #define WL_SPUN     } break;
 #define WL_AGAIN(F) continue
 
