@@ -182,7 +182,6 @@ const WG_DEFS = `
 #define WG_BLK   (1ull << 63)
 #define WG_LOCS  0x7FFFFFFFull
 #define WG_QCAP  (65535u * 64u)
-#define WG_PARK  RING_OFF
 #define WG_PARKED (RING_OFF + LANES)
 #define WG_WANT  (RING_OFF + LANES + 1)
 #define wg_qat(s)  (RING_OFF + 2 * LANES + (u64)(s) * WG_QCAP)
@@ -463,15 +462,16 @@ static bool wg_takes(Corpus H, u32 i, bool pack) {
 
 static void wg_task(Corpus H, u32 i, Term t, u32 seq) {
   Env  e = { H, H + ALC_OFF + i };
-  Term r = work_loop(e, (Stk)(H + STAK_OFF + i), t, seq);
+  work_loop(e, (Stk)(H + STAK_OFF + i), t, seq);
+  Term r = H[WG_PARK + i];
   if (r == 0) {
     return;
   }
   if (term_tag(r) == TAG_PAK) {
-    H[WG_PARK + i] = r;
     a32_add(a32_at(H, WG_PARKED), 1);
     return;
   }
+  H[WG_PARK + i] = 0;
   Loc loc = term_loc(r);
   u32 ar  = fid_arity((u32)term_aux(r));
   if (a32_load(a32_at(H, loc + ar + 1)) == 0) {
@@ -546,7 +546,8 @@ static void wg_run(Corpus H, u32 i) {
 
 // The pack's rounds run in a kernel of their own: in the tasks' kernel the
 // pack's code made Slash Boss 3D's first bang allocate past the heap in its
-// eighth round, before any packing, on most runs.
+// eighth round, before any packing, on most runs (as a word the work loop
+// returned did on Metal, before WL_OUT; not tried again since).
 static void wg_packs(Corpus H, u32 i) {
   if (!wg_takes(H, i, true)) {
     return;

@@ -2114,8 +2114,8 @@ function emit_jump(fl: File, args: string[], k: Bend.Name,
   fl.seg.fork ||= bang;
   if (bang || fl.seg.def !== k) {
     block(fl, `if (${bang ? "!seq" : `!DEVICE && !seq && fid_nofk(${fid})`}) {`, () =>
-      file_push(fl, `return term_tsk(${fid}, ${
-        emit_task(fl, fid, 0, args)});`));
+      file_push(fl, `WL_OUT(term_tsk(${fid}, ${
+        emit_task(fl, fid, 0, args)}));`));
   }
   args.forEach((a, i) => file_push(fl, `r${i} = ${a};`));
   if (fl.seg.def !== k) {
@@ -2638,7 +2638,7 @@ function emit_fork(fl: File, x: HLet, ers: HTerm[]): void {
         emit_holes(fl, jn, idx + 1, w - 1);
         idx += w;
       });
-      file_push(fl, `return ${jt};`);
+      file_push(fl, `WL_OUT(${jt});`);
     });
     fl.uses = uses;
   }
@@ -3559,6 +3559,19 @@ using namespace metal;
 #define STK(I)    sp[(int64_t)(I) * LANE_STEP]
 
 #define WL_RETN(N)  { rn = (N); WL_POP(); }
+// The work loop's result: a task ready to run, a join whose forks are to be
+// pushed or, in a kernel of a group, the PAK term the lane parks with. A
+// page's lane leaves it in its own word, zero as a task starts, and returns
+// nothing (wg_task takes it there): on Metal a word the loop returned
+// reached its caller with a half or all of it zero when hundreds of
+// workgroups ran Slash Boss 3D, while the same word, stored to the lane's
+// memory before the return, read back whole.
+#if DEVICE && defined(WG_FUEL)
+#define WG_PARK     RING_OFF
+#define WL_OUT(X)   { e.alc[WG_PARK - ALC_OFF] = (X); return 0; }
+#else
+#define WL_OUT(X)   return (X)
+#endif
 #define WL_CONT     STK(-3)
 #define WL_IDX      STK(-2)
 #define WL_POPN(N)  sp -= N * LANE_STEP
@@ -4652,7 +4665,7 @@ static const WlFn wl_tab[] = { WL_TABLE };
     WL_STOW(wn) \
     sp += (wn + 1) * LANE_STEP; \
     STK(-1) = rn | (u64)seq << 32; \
-    return term_make(TAG_PAK, fid, (u32)(sp - s0) / (u32)CUBE); \
+    WL_OUT(term_make(TAG_PAK, fid, (u32)(sp - s0) / (u32)CUBE)); \
   }
 #else
 #define WL_UNPARK
@@ -4749,7 +4762,7 @@ static Reply work_loop(Env e, Stk sp, Term t, u32 seq) {
       WL_TAKE(rv)
       WL_DYN(wf);
     }
-    return task_deliver(e.mem, cont, idx, rv, n);
+    WL_OUT(task_deliver(e.mem, cont, idx, rv, n));
   }}
 
 #if DEVICE
