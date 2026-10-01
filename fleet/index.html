@@ -1,0 +1,211 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bend 2 on WebGPU: fleet</title>
+<style>
+  :root { --bg: #111; --fg: #ccc; --dim: #888; --line: #333; --link: #8cf; --card: #181818;
+    --ok: #7c6; --bad: #f76; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 8px; color: #eee; }
+  p { margin: 0 0 14px; max-width: 760px; }
+  a { color: var(--link); }
+  .dim { color: var(--dim); }
+  button { font: inherit; color: #eee; background: #234; border: 1px solid #456;
+    border-radius: 4px; padding: 6px 14px; cursor: pointer; }
+  button:disabled { color: var(--dim); background: #222; border-color: var(--line); cursor: default; }
+  .wide { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--line);
+    vertical-align: top; white-space: nowrap; }
+  td.note { white-space: normal; min-width: 220px; }
+  th { color: var(--dim); font-weight: normal; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  #stage iframe { width: 100%; height: 420px; border: 1px solid var(--line); background: #000; }
+  textarea { width: 100%; height: 160px; box-sizing: border-box; background: var(--card);
+    color: var(--fg); border: 1px solid var(--line); font: 12px/1.4 ui-monospace, monospace; }
+</style>
+<main>
+  <h1>Fleet</h1>
+  <p>
+    Runs the gallery's programs on this device, one at a time, and reports what each did: whether its
+    <code>!</code> ran on the GPU, whether the result is right, how long the shader took to compile and
+    how fast it runs. A report from a GPU we have never held is how the compiler learns it.
+  </p>
+  <p class="dim">
+    Nothing is sent anywhere: the report stays on this page until you copy it. Keep this tab in
+    front while it runs (a hidden tab is slowed down, and its numbers mean nothing). The first run compiles
+    every shader, which on Windows takes a minute or two a program; a second run reads them from the
+    browser's cache. Every loop of a shader counts its turns, so no dispatch can hold the GPU.
+  </p>
+  <p><button id="go">Run all</button> <button id="copy" disabled>Copy the report</button> <span id="now" class="dim"></span></p>
+  <p id="dev" class="dim"></p>
+  <div class="wide">
+    <table>
+      <thead><tr><th>program</th><th>result</th><th>! on</th><th>compile</th><th>fps</th>
+        <th>ms a !</th><th>rounds a !</th><th>note</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div id="stage"></div>
+  <textarea id="json" readonly hidden></textarea>
+</main>
+<script src="../coi-serviceworker.js"></script>
+<script src="tests.js"></script>
+<script>
+// A program runs in a frame of its own, which is dropped before the next: a page keeps its GPU
+// memory while its document lives. ?only=a,b runs those programs alone; the URL's other parameters
+// go on to every program (?swift, on a test build, runs them on the CPU).
+const url = new URLSearchParams(location.search);
+const only = (url.get("only") || "").split(",").filter(Boolean);
+url.delete("only");
+const extra = url.toString();
+const tests = TESTS.filter((t) => only.length === 0 || only.includes(t.id));
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const report = { when: new Date().toISOString(), ua: navigator.userAgent,
+  cores: navigator.hardwareConcurrency, adapter: null, runs: [] };
+
+async function until(f, ms) {
+  for (const t0 = performance.now(); performance.now() - t0 < ms; await sleep(100)) {
+    const x = f();
+    if (x) {
+      return x;
+    }
+  }
+  return null;
+}
+
+// What the device says of itself.
+async function adapter() {
+  const ad = navigator.gpu && await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!ad) {
+    return null;
+  }
+  const i = ad.info;
+  return { vendor: i.vendor, architecture: i.architecture, device: i.device, description: i.description,
+    fallback: i.isFallbackAdapter, features: [...ad.features].sort(),
+    maxBufferSize: ad.limits.maxBufferSize, maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize,
+    maxComputeInvocationsPerWorkgroup: ad.limits.maxComputeInvocationsPerWorkgroup };
+}
+
+// A frame's output, without the exit line.
+const text = (f) => (f.contentDocument.getElementById("bend-out").textContent || "")
+  .replace(/(^|\n)exit \d+\n?$/, "").trim();
+
+// A batch program's result against what it should print: the same lines, or (near) lines of numbers
+// no further from them than a float's noise makes a block of pixels.
+function judge(t, out) {
+  if (t.want !== undefined) {
+    return out === t.want ? { ok: true } : { ok: false, note: "printed " + JSON.stringify(out.slice(0, 80)) };
+  }
+  if (t.near !== undefined) {
+    const got = out.split("\n").map(Number);
+    const d = t.near.map((x, i) => Math.abs(x - got[i]));
+    const far = Math.max(...d);
+    return { ok: got.length === t.near.length && far <= t.slack,
+      note: d.filter((x) => x > 0).length + " of " + d.length + " lines differ, by " + far + " at most" };
+  }
+  return { ok: true, note: out.split("\n").slice(-t.keep).join(" | ") };
+}
+
+async function run(t) {
+  const r = { id: t.id, q: t.q || "", ok: false };
+  const f = document.createElement("iframe");
+  f.src = "t/" + t.id + "/?" + ["grace=900000", t.q, extra].filter(Boolean).join("&");
+  $("stage").replaceChildren(f);
+  const M = () => f.contentWindow && f.contentWindow.Module;
+  const hidden = () => document.visibilityState !== "visible";
+  try {
+    const on = await until(() => M() && M().bendOn && !/while its shader/.test(M().bendOn) && M().bendOn, 960000);
+    r.on = on || "no status in 16 minutes";
+    r.gpu = /^the ! on (?!the cores)/.test(r.on);
+    r.compile = Number((/compiled in ([\d.]+) s/.exec(r.on) || [])[1]);
+    const stat = () => (M().bendGpu ? M().bendGpu.stat.slice() : [0, 0, 0]);
+    if (t.secs) {
+      await sleep(2000);
+      const s0 = stat(), n0 = M().bendFrames | 0, t0 = performance.now();
+      r.hidden = hidden();
+      await sleep(t.secs * 1000);
+      const s1 = stat(), dt = (performance.now() - t0) / 1000;
+      r.hidden = r.hidden || hidden();
+      r.fps = ((M().bendFrames | 0) - n0) / dt;
+      r.bangs = s1[0] - s0[0];
+      r.rounds = (s1[1] - s0[1]) / r.bangs;
+      r.ms = (s1[2] - s0[2]) / r.bangs;
+      const err = /^bend: .*/m.exec(text(f));
+      r.ok = r.fps > 0 && !err;
+      r.note = err ? err[0] : "";
+    } else {
+      const done = await until(() => /(^|\n)(exit \d+|bend: .*)\n?$/.test(
+        f.contentDocument.getElementById("bend-out").textContent), t.wait || 120000);
+      const out = text(f), s = stat();
+      r.bangs = s[0];
+      r.rounds = s[1] / s[0];
+      r.ms = s[2] / s[0];
+      r.ran = M().bendRan;
+      Object.assign(r, done ? judge(t, out) : { ok: false, note: "no end in " + (t.wait || 120000) / 1000 + " s" });
+      if (t.turns && r.bangs > 0) {
+        r.note = (r.ms * 1e6 / t.turns).toFixed(3) + " ns a lane's turn; " + (r.note || "");
+      }
+    }
+    if (r.ok && !(r.gpu && r.bangs > 0)) {
+      r.ok = false;
+      r.note = "its ! never reached the GPU. " + (r.note || "");
+    }
+  } catch (e) {
+    r.note = String(e);
+  }
+  const G = M() && M().bendGpu;
+  if (G && G.dev) {
+    G.dev.destroy();
+  }
+  $("stage").replaceChildren();
+  return r;
+}
+
+const num = (x, d) => (Number.isFinite(x) ? x.toFixed(d) : "");
+function show(tr, t, r) {
+  const cells = r ? [`<span class="${r.ok ? "ok" : "bad"}">${r.ok ? "ok" : "FAIL"}</span>`,
+    (r.on || "").replace(/^the ! on /, "").replace(/, compiled in .*/, "").slice(0, 44),
+    num(r.compile, 1) && num(r.compile, 1) + " s", num(r.fps, 1), num(r.ms, 2), num(r.rounds, 1),
+    (r.hidden ? "tab hidden. " : "") + (r.note || "")] : ["", "", "", "", "", "", ""];
+  tr.innerHTML = `<td>${t.title}${t.q ? " <span class=dim>" + t.q + "</span>" : ""}</td>`
+    + cells.map((c, i) => `<td class="${i >= 2 && i <= 5 ? "num" : i === 6 ? "note" : ""}">${c}</td>`).join("");
+}
+
+const rows = tests.map((t) => {
+  const tr = $("rows").appendChild(document.createElement("tr"));
+  show(tr, t, null);
+  return tr;
+});
+
+adapter().then((a) => {
+  report.adapter = a;
+  $("dev").textContent = a ? "This device: " + [a.vendor, a.architecture, a.device, a.description]
+    .filter(Boolean).join(" ") + (a.fallback ? " (a software adapter)" : "") : "This browser has no WebGPU adapter: "
+    + "every ! will run on the cores.";
+});
+
+$("go").onclick = async () => {
+  $("go").disabled = true;
+  report.runs = [];
+  for (const [i, t] of tests.entries()) {
+    $("now").textContent = "running " + t.title + (t.q ? " " + t.q : "") + " (" + (i + 1) + " of " + tests.length + ")";
+    const r = await run(t);
+    report.runs.push(r);
+    show(rows[i], t, r);
+  }
+  $("now").textContent = "done";
+  $("json").hidden = false;
+  $("json").value = JSON.stringify(report, null, 1);
+  $("copy").disabled = false;
+  $("go").disabled = false;
+};
+
+$("copy").onclick = () => navigator.clipboard.writeText($("json").value).then(
+  () => { $("now").textContent = "copied"; }, () => { $("json").select(); });
+</script>

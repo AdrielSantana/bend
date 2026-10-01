@@ -40,6 +40,12 @@
     <li><a href="par-sort/"><b>Parallel sort</b></a>: a bitonic sort of 2<sup>16</sup> numbers; prints one line.</li>
     <li><a href="par-sum/"><b>Parallel sum</b></a>: a fork/join sum of 2<sup>16</sup> numbers; prints one line.</li>
   </ul>
+  <p>
+    <a href="fleet/"><b>Fleet</b></a> runs a set of these programs on your device, built by the
+    branch's latest compiler, and reports what each did: whether its <code>!</code> ran on the GPU,
+    whether the result is right, how long the shader took to compile and how fast it runs. Nothing
+    is sent: the report stays on the page until you copy it.
+  </p>
   <p class="dim">
     Needs WebGPU (Chrome or Edge on the desktop, recent Safari) and SharedArrayBuffer.
     Without WebGPU, the <code>!</code> runs on the cores. GitHub Pages sends no COOP/COEP
