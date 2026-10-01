@@ -107,8 +107,10 @@ type Fun = { n: number; h: HTerm | null; live: Dom[]; lays: Lay[]; ret: Lay };
 // so that no file declares them. FOLD_FUEL caps the nodes that unfolds
 // add to a segment, so a literal-bounded loop does not unroll into its
 // caller. A spin of SPIN_FAR lines is a call (at 128, raytrace lost
-// 31% on PAR-CPU). WIDE is the widest flat layout or segment; a node past
-// it pads to its size class and keeps 240 plus log2 of it in CID_T.
+// 31% on PAR-CPU) but where a loop calls it (a call a turn cost a
+// Bendcraft frame 14% on Metal). WIDE is the widest flat layout or
+// segment; a node past it pads to its size class and keeps 240 plus
+// log2 of it in CID_T.
 
 const CLO_APPLY = "Clo~apply";
 
@@ -3029,8 +3031,11 @@ export function compile_book(book: Bend.Book): string {
     `#define BLK_SHR ${Number(fl.hot.has("t:Array"))}`);
   const tabs = [defs.join("\n"), ...[...fl.tabs].map(([r, i]) =>
     `CONSTV u64 TAB_${i}[] = { ${r} };`)].join("\n\n");
+  const looped = new Set([...fl.segs, ...fl.spins].flatMap((s) =>
+    s.spin ? [...s.refs] : []));
   const spins = [`CONSTV u64 STAT_IMG[] = { ${fl.img.join(", ") || 0} };`,
-    ...fl.spins.map((s) => s.lines.join("\n"))].join("\n\n");
+    ...fl.spins.map((s) => s.lines.join("\n").replace(/^FAR/,
+      looped.has(s.fid) ? "INLINE" : "FAR"))].join("\n\n");
   const segs = compile_segs(fl, dev);
   if (/\bundefined\b/.test([tabs, spins, segs].join("\n"))) {
     die("an unbound name in the emitted C");
