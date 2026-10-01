@@ -2083,36 +2083,47 @@ function fn_body(f: Fn, d: N): void {
 }
 
 // The device program: the functions the plan, the packing and the window
-// reach and the records the rounds pass by value; the runs, a kernel a
-// group of fids, run_0.., with the functions only they reach; Direct3D's
-// run with its own copy of the functions it reaches; and TAB's words. A
-// page compiles the first with the runs, or on Windows with Direct3D's.
+// reach and the records the rounds pass by value; the run, one kernel of
+// every fid, with the functions only it reaches; Direct3D's run, a text of
+// its own: a copy made to inline within BUDGET (run_d3d) or, when the run
+// is split, a kernel a group of fids, run_0.., with the functions they
+// reach; and TAB's words. A page compiles the first with the run, or on
+// Windows with Direct3D's: Metal and SPIR-V keep calls, and there the split
+// costs more than it saves (Bendcraft's frame on an M5 read 65 ms in four
+// kernels and 38 in one).
 function device_of(ast: N, helpers: string, gs: Set<number>[])
   : { code: string; run: string; d3d: string; tab: number[] } {
   const u = unit_new(ast);
   ["wg_plan", "wg_packs", "wg_window"].forEach((f) =>
     inst_of(u, f, []));
   const fns = translated(u);
-  const shared = fns.size;
-  const runs = gs.map((grp, g) => {
-    const v: Unit = gs.length > 1 ? { ...u, pre: `g${g}_`, grp } : u;
-    const run = inst_of(v, "wg_run", []);
-    translated(v, fns);
-    return ["@compute @workgroup_size(64)",
-      `fn run_${g}(@builtin(global_invocation_id) g: vec3<u32>) {`,
-      `  ${run}(0u, g.x);`, "}"].join("\n");
-  });
-  const all = [...fns.values()];
-  const v: Unit = { ...u, done: new Map(), todo: [], insts: new Map(),
-    mach: new Set(), marked: new Set(), pre: "d_" };
-  inst_of(v, "wg_run", []);
-  const d3d = gs.length > 1 ? "" : run_d3d(v, helpers, translated(v));
+  const text = (pre: string, runs: (v: Unit) => Unit[]): string => {
+    const v: Unit = { ...u, done: new Map(u.done), todo: [],
+      insts: new Map(u.insts), pre };
+    const all = new Map(fns);
+    const es = runs(v).map((w, g) => {
+      const run = inst_of(w, "wg_run", []);
+      translated(w, all);
+      return ["@compute @workgroup_size(64)",
+        `fn run_${g}(@builtin(global_invocation_id) g: vec3<u32>) {`,
+        `  ${run}(0u, g.x);`, "}"].join("\n");
+    });
+    return [...es, ...[...all.values()].slice(fns.size)].join("\n");
+  };
+  const copy = (): string => {
+    const d: Unit = { ...u, done: new Map(), todo: [], insts: new Map(),
+      mach: new Set(), marked: new Set(), pre: "d_" };
+    inst_of(d, "wg_run", []);
+    return run_d3d(d, helpers, translated(d));
+  };
+  const d3d = gs.length === 1 ? copy() : text("c_", (v) => gs.map((grp, g) =>
+    ({ ...v, pre: `g${g}_`, grp })));
+  const run = text("c_", (v) => [v]);
   const recs = [...u.recs.keys()].map((id) => ty_rec(u, id)).filter((t) =>
     t.k === "rec" && !t.union && t.fs.length > 0).map((t) => t.k === "rec"
     ? `struct ${ty_wgsl(t)} { ${t.fs.map((x) => `f_${x.name}: `
       + ty_wgsl(x.t)).join(", ")} }\n` : "");
-  return { code: recs.join("") + all.slice(0, shared).join("\n"),
-    run: [...runs, ...all.slice(shared)].join("\n"), d3d,
+  return { code: recs.join("") + [...fns.values()].join("\n"), run, d3d,
     tab: u.tab };
 }
 
@@ -3169,12 +3180,12 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
     Atomics.notify(HEAP32, q >> 2);
   };
   (async function() {
-    // Windows runs WebGPU on Direct3D, which gets run_d3d when there is one.
-    var d3d = /Windows/.test(navigator.userAgent);
-    var runs = d3d && UTF8ToString(src_d3d).trim() !== "" ? ["run_d3d"]
-      : UTF8ToString(src_run).match(/fn run_[0-9]+/g).map(function(f) {
-        return f.slice(3);
-      });
+    // Windows runs WebGPU on Direct3D, which gets a text of its own.
+    var text = UTF8ToString(/Windows/.test(navigator.userAgent) ? src_d3d
+      : src_run);
+    var runs = text.match(/fn run_[a-z0-9]+/g).map(function(f) {
+      return f.slice(3);
+    });
     // A laptop with two GPUs hands out its integrated one by default, the
     // one that also draws the screen; a software adapter (SwiftShader, let
     // through by a flag) runs the rounds on the CPU, slower than the cores.
@@ -3278,8 +3289,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
       Atomics.store(HEAP32, ready >> 2, v);
     };
     var compiled = (async function() {
-      var mod = dev.createShaderModule({ code: UTF8ToString(src)
-        + UTF8ToString(runs[0] === "run_d3d" ? src_d3d : src_run) });
+      var mod = dev.createShaderModule({ code: UTF8ToString(src) + text });
       var bad = (await mod.getCompilationInfo()).messages.filter(function(m) {
         return m.type === "error";
       });
@@ -4076,7 +4086,7 @@ export function webgpu_page(c: string, dir: string, cc: string,
 }
 
 // The glue: GPU_SRC (what plan, pack and window reach), GPU_RUN (the run's
-// kernels) and GPU_D3D (the Direct3D copy), and TAB's words, and its path.
+// kernel) and GPU_D3D (Direct3D's text), and TAB's words, and its path.
 function glue_of(c: string, dir: string, ast: N, gs: Set<number>[]): string {
   const helpers = HELPERS(mirror(c));
   const dev = device_of(ast, helpers, gs);
