@@ -116,7 +116,10 @@ const PAGE = `<!doctype html>
   };
   setInterval(rate, 1000);
 </script>
-<script src="NAME.js"></script>
+<script>
+  document.write('<script src="NAME' + (BANGS && /Windows/.test(
+    navigator.userAgent) ? ".d3d" : "") + '.js"><\\/script>');
+</script>
 `;
 
 const BASE = Bend.BASE_BEND;
@@ -453,29 +456,34 @@ function cli_build(bin: string, file: string): void {
 // and .wasm: emcc 3.1.35+ (tail calls), the program on a worker a core (the
 // pool holds 4 more: the proxied main and the IO helpers), 2 GiB of memory.
 // A `!` program carries its WebGPU lane (bend2/wgsl.ts, from clang's AST of
-// the device C, which may recompile it with defs cut) and runs the ! on the
-// cores where the browser has none.
+// the device C) and runs the ! on the cores where the browser has none; it
+// is built twice, as it came and, as .d3d.js, cut for Direct3D, which the
+// page loads on Windows.
 function cli_build_web(page: string, file: string,
   recompile: (cuts: Set<string>) => string): void {
-  const base = page.slice(0, -".html".length);
-  const emcc = process.env.EMCC || "emcc";
-  const c    = fs.readFileSync(file, "utf8");
-  const lane = /^#define BANGS\s+0$/m.test(c) ? null
-    : Wgsl.webgpu_page(c, path.dirname(file), cc_find(false), recompile);
-  const gpu  = lane === null ? [] : ["-DBEND_WEBGPU=\"" + lane.glue + "\""];
-  fs.writeFileSync(file, lane?.c ?? c);
-  const args = ["-std=gnu11", "-O3", "-pthread", "-mtail-call", file, ...gpu,
-    "-sPROXY_TO_PTHREAD", "-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+4",
-    "-sINITIAL_MEMORY=2147483648", "-sENVIRONMENT=web,worker",
-    "-sEXIT_RUNTIME=1", "-o", path.resolve(base + ".js")];
-  if (child.spawnSync(emcc, args, { stdio: "inherit" }).status !== 0) {
-    throw "Error: " + emcc + " failed to build " + page
-      + " (a page needs Emscripten 3.1.35+ on PATH, or at $EMCC)";
-  }
-  const name = path.basename(base).replace(/[&<"]/g, (c) =>
+  const base  = page.slice(0, -".html".length);
+  const emcc  = process.env.EMCC || "emcc";
+  const c     = fs.readFileSync(file, "utf8");
+  const bangs = !/^#define BANGS\s+0$/m.test(c);
+  const progs = bangs ? Wgsl.webgpu_page(c, path.dirname(file),
+    cc_find(false), recompile).map((p) => ({ c: p.c,
+    gpu: ["-DBEND_WEBGPU=\"" + p.glue + "\""] })) : [{ c, gpu: [] }];
+  progs.forEach((p, i) => {
+    fs.writeFileSync(file, p.c);
+    const args = ["-std=gnu11", "-O3", "-pthread", "-mtail-call", file,
+      ...p.gpu, "-sPROXY_TO_PTHREAD",
+      "-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+4",
+      "-sINITIAL_MEMORY=2147483648", "-sENVIRONMENT=web,worker",
+      "-sEXIT_RUNTIME=1", "-o", path.resolve(base + [".js", ".d3d.js"][i])];
+    if (child.spawnSync(emcc, args, { stdio: "inherit" }).status !== 0) {
+      throw "Error: " + emcc + " failed to build " + page
+        + " (a page needs Emscripten 3.1.35+ on PATH, or at $EMCC)";
+    }
+  });
+  const name = path.basename(base).replace(/[&<"']/g, (c) =>
     "&#" + c.charCodeAt(0) + ";");
   fs.writeFileSync(page, PAGE.replaceAll("NAME", name)
-    .replaceAll("BANGS", String(gpu.length > 0)));
+    .replaceAll("BANGS", String(bangs)));
 }
 
 // cli_base prints the base library; with --types, its type declarations

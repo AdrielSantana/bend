@@ -2092,26 +2092,24 @@ function fn_body(f: Fn, d: N): void {
 }
 
 // The device program: the functions the plan, the packing and the window
-// reach and the records the rounds pass by value; the run, one kernel of
-// every fid, with the functions only it reaches; Direct3D's run, a text of
-// its own: a copy made to inline within BUDGET (run_d3d) or, when the run
-// is split, a kernel a group of fids, run_0.., with the functions they
-// reach; and TAB's words. A page compiles the first with the run, or on
-// Windows with Direct3D's: Metal and SPIR-V keep calls, and there the split
-// costs more than it saves (Bendcraft's frame on an M5 read 65 ms in four
-// kernels and 38 in one).
-function device_of(ast: N, helpers: string, gs: Set<number>[])
-  : { code: string; run: string; d3d: string; tab: number[] } {
+// reach and the records the rounds pass by value; its run, with the
+// functions only it reaches; and TAB's words. The run is one kernel of
+// every fid, or with gs, the groups of fids of Direct3D's program
+// (webgpu_page), a kernel a group, run_0.., and for one group a copy made
+// to inline within BUDGET (run_d3d).
+function device_of(ast: N, helpers: string, gs?: Set<number>[])
+  : { code: string; run: string; tab: number[] } {
   const u = unit_new(ast);
   ["wg_plan", "wg_packs", "wg_window"].forEach((f) =>
     inst_of(u, f, []));
   inst_of(u, "err_fuel", [undefined, undefined]);
   const fns = translated(u);
-  const text = (pre: string, runs: (v: Unit) => Unit[]): string => {
+  const kernels = (grps: (Set<number> | undefined)[]): string => {
     const v: Unit = { ...u, done: new Map(u.done), todo: [],
-      insts: new Map(u.insts), pre };
+      insts: new Map(u.insts) };
     const all = new Map(fns);
-    const es = runs(v).map((w, g) => {
+    const es = grps.map((grp, g) => {
+      const w: Unit = { ...v, pre: grp ? `g${g}_` : "c_", grp };
       const run = inst_of(w, "wg_run", []);
       translated(w, all);
       return ["@compute @workgroup_size(64)",
@@ -2126,14 +2124,12 @@ function device_of(ast: N, helpers: string, gs: Set<number>[])
     inst_of(d, "wg_run", []);
     return run_d3d(d, helpers, translated(d));
   };
-  const d3d = gs.length === 1 ? copy() : text("c_", (v) => gs.map((grp, g) =>
-    ({ ...v, pre: `g${g}_`, grp })));
-  const run = text("c_", (v) => [v]);
+  const run = gs?.length === 1 ? copy() : kernels(gs ?? [undefined]);
   const recs = [...u.recs.keys()].map((id) => ty_rec(u, id)).filter((t) =>
     t.k === "rec" && !t.union && t.fs.length > 0).map((t) => t.k === "rec"
     ? `struct ${ty_wgsl(t)} { ${t.fs.map((x) => `f_${x.name}: `
       + ty_wgsl(x.t)).join(", ")} }\n` : "");
-  return { code: recs.join("") + [...fns.values()].join("\n"), run, d3d,
+  return { code: recs.join("") + [...fns.values()].join("\n"), run,
     tab: u.tab };
 }
 
@@ -2163,9 +2159,8 @@ function translated(u: Unit, fns = new Map<string, string>())
 // own (WGSL has no recursion, so each runs one call at a time), a call
 // sets its parameters and the state to come back to and jumps to its first
 // state, a return jumps back, and a pointer into the caller's locals is
-// copied in and out (machine). Metal and SPIR-V keep calls and compile
-// run; Windows compiles the copy in its place (device_of). Within 175
-// thousand lines, DXC -O3 on a Mac (four times the pace above) compiles
+// copied in and out (machine). Direct3D's program compiles the copy when
+// its run is one group (device_of). Within 175 thousand lines, DXC -O3 on a Mac (four times the pace above) compiles
 // Slash Boss's merges in 6.2 s and Bendcraft's machine in 21 s; within 50
 // thousand every function of Bendcraft was a state, 22 thousand calls into
 // states a pixel where 175 thousand leaves a thousand.
@@ -3174,8 +3169,8 @@ static u64    gpu_live;
 #define gpu_load(b)
 
 EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
-  const char* src_d3d, const u32* tab, u32 n, GpuReq* q, u32* ready, u32 win,
-  u32 pix, u32 least, u32 start, u32 groups),
+  const u32* tab, u32 n, GpuReq* q, u32* ready, u32 win, u32 pix, u32 least,
+  u32 start, u32 groups),
   {
   var end = function(v, why) {
     if (why) {
@@ -3186,9 +3181,7 @@ EM_JS(void, webgpu_js_open, (const char* src, const char* src_run,
     Atomics.notify(HEAP32, q >> 2);
   };
   (async function() {
-    // Windows runs WebGPU on Direct3D, which gets a text of its own.
-    var text = UTF8ToString(/Windows/.test(navigator.userAgent) ? src_d3d
-      : src_run);
+    var text = UTF8ToString(src_run);
     var runs = text.match(/fn run_[a-z0-9]+/g).map(function(f) {
       return f.slice(3);
     });
@@ -3534,8 +3527,8 @@ static void gpu_ask(GpuReq* q, bool run) {
 
 static bool gpu_probe(void) {
   MAIN_THREAD_ASYNC_EM_ASM({ webgpu_js_open($0, $1, $2, $3, $4, $5, $6,
-    $7, $8, $9, $10, $11); }, GPU_SRC, GPU_RUN, GPU_D3D, GPU_TAB,
-    sizeof GPU_TAB / 4, &gpu_req, &gpu_compiled, WG_WIN, (u32)wg_qat(2),
+    $7, $8, $9, $10); }, GPU_SRC, GPU_RUN, GPU_TAB, sizeof GPU_TAB / 4,
+    &gpu_req, &gpu_compiled, WG_WIN, (u32)wg_qat(2),
     (u32)(GPU_IMG + CUBE * PAGE_LEN), (u32)GPU_START, (u32)(LANES / 64));
   bool ok = gpu_wait(&gpu_req);
   gpu_words = gpu_req.put[0].words;
@@ -4068,12 +4061,20 @@ function mirror(c: string): boolean {
 // Export
 // ======
 
-// The page's lane for a program with `!`: its C, cut (recompiled without
-// fusing the defs cut_of names) until every fid's case fits ROOM, and the
-// glue, with the WGSL and TAB's words it hands the browser, written into
-// dir, for the template's BEND_WEBGPU.
+// The page's two programs for a Bend program with `!`, each its C and the
+// glue with the WGSL and TAB's words it hands the browser, written into
+// dir for the template's BEND_WEBGPU. The first is the program as it came,
+// its run one kernel: Metal and SPIR-V keep calls, and compile it as it
+// is. The second is Direct3D's, whose compilers inline every call: cut
+// (recompiled without fusing the defs cut_of names) until every fid's case
+// fits ROOM, its run a kernel a group of fids. A cut is a task's frame at
+// every call and a kernel left is a park, which Metal pays for nothing:
+// Bendcraft's frame on an M5 at 1470x796 reads 39 ms whole, 50 with the
+// three cuts in one kernel and 65 in the six kernels.
 export function webgpu_page(c: string, dir: string, cc: string,
-  recompile: (cuts: Set<string>) => string): { c: string; glue: string } {
+  recompile: (cuts: Set<string>) => string): { c: string; glue: string }[] {
+  const whole = { c, glue: glue_of(c, dir, "webgpu.c",
+    ast_of(c, dir, cc, false)) };
   const cuts = new Set<string>();
   for (;;) {
     const fids = new Map([...c.matchAll(/^#define FID_(\w+) (\d+)$/gm)].map(
@@ -4094,27 +4095,27 @@ export function webgpu_page(c: string, dir: string, cc: string,
       .filter((d): d is string => d !== undefined && !cuts.has(d));
     if (more.length === 0) {
       const gs = packed(cs, flow_of(c, dev), every);
-      return { c, glue: glue_of(c, dir, gs.length > 1 ? ast
-        : ast_of(c, dir, cc, false), gs) };
+      return [whole, { c, glue: glue_of(c, dir, "webgpu.d3d.c",
+        gs.length > 1 ? ast : ast_of(c, dir, cc, false), gs) }];
     }
     more.forEach((d) => cuts.add(d));
     c = recompile(cuts);
   }
 }
 
-// The glue: GPU_SRC (what plan, pack and window reach), GPU_RUN (the run's
-// kernel) and GPU_D3D (Direct3D's text), and TAB's words, and its path.
-function glue_of(c: string, dir: string, ast: N, gs: Set<number>[]): string {
+// A program's glue, written as name: GPU_SRC (what plan, pack and window
+// reach), GPU_RUN (its run) and TAB's words; and its path.
+function glue_of(c: string, dir: string, name: string, ast: N,
+  gs?: Set<number>[]): string {
   const helpers = HELPERS(mirror(c));
   const dev = device_of(ast, helpers, gs);
   const tab = dev.tab.length > 0 ? dev.tab : [0];
   const src = KERNELS(tab.length) + helpers + "\n" + dev.code;
-  const glue = path.join(dir, "webgpu.c");
+  const glue = path.join(dir, name);
   const str = (s: string): string => s.split("\n").map((l) =>
     JSON.stringify(l + "\n")).join("\n") + ";\n\n";
   fs.writeFileSync(glue, "static const char GPU_SRC[] =\n" + str(src)
     + "static const char GPU_RUN[] =\n" + str(dev.run)
-    + "static const char GPU_D3D[] =\n" + str(dev.d3d)
     + "static const u32 GPU_TAB[] = { " + tab.join(", ") + " };\n" + GLUE);
   return glue;
 }
