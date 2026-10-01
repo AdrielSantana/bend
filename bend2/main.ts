@@ -36,6 +36,7 @@ const VERSION = "2.0.34";
 const USAGE = [
   ["bend <file.bend> [args]", "check the file, then run main with args"],
   ["bend <file.bend> -o <out>", "build a binary, or C, JS, .mjs or BendTT by extension"],
+  ["bend <file.bend> -o <out> --relaxed-math", "a binary whose Metal ! may reorder and fuse floats"],
   ["bend <file.bend> --check-only", "check the file and its imports; run nothing"],
   ["bend <file.bend> --verdict", "check it, then recheck it with the proven kernel"],
   ["bend <file.bend> --publish [<name>@<version>]", "publish the file and its imports; a name needs login"],
@@ -234,6 +235,7 @@ async function cli_file(args: string[]): Promise<void> {
   let verdict = false;
   let checkup = false;
   let publish = false;
+  let relaxed = false;
   let named: string | undefined;
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
@@ -241,6 +243,8 @@ async function cli_file(args: string[]): Promise<void> {
       return cli_say(1, HELP);
     } else if (a === "--check-only") {
       only = true;
+    } else if (a === "--relaxed-math") {
+      relaxed = true;
     } else if (a === "--verdict") {
       verdict = true;
     } else if (a === "--checkup") {
@@ -312,7 +316,7 @@ async function cli_file(args: string[]): Promise<void> {
       if (ins.has(at) || (fs.existsSync(at) && fs.statSync(at).isDirectory())) {
         cli_fail("-o " + out + " is a file the program reads, or a directory");
       }
-      cli_emit(book, out);
+      cli_emit(book, out, relaxed);
     }
   } catch (e) {
     cli_say(2, book_err(e) + "\n");
@@ -355,7 +359,7 @@ function path_real(p: string): string {
   return fs.existsSync(p) ? fs.realpathSync(p) : path.resolve(p);
 }
 
-function cli_emit(book: Bend.Book, out: string): void {
+function cli_emit(book: Bend.Book, out: string, relaxed: boolean): void {
   if (out.endsWith(".mjs")) {
     fs.writeFileSync(out, Comp.js_lib(book, true));
   } else if (/\.c?js$/.test(out)) {
@@ -372,7 +376,7 @@ function cli_emit(book: Bend.Book, out: string): void {
     const c   = path.join(dir, path.basename(out) + ".c");
     fs.writeFileSync(c, Comp.compile_book(book));
     try {
-      cli_build(out, c);
+      cli_build(out, c, relaxed);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -418,8 +422,9 @@ function cc_find(gpu: boolean): string {
 // CUDA at $CUDA_HOME, else at /usr/local/cuda, its libraries in lib64 or, as
 // nix lays them, lib; else the ! runs on the cores). On macOS a program with
 // a framework (#import: a window, audio) builds as Objective-C; on Linux it
-// links the X11 and ALSA libraries it includes.
-function cli_build(bin: string, file: string): void {
+// links the X11 and ALSA libraries it includes. `relaxed` lets Metal reorder
+// and fuse the floats of the ! (--relaxed-math); CUDA keeps them exact.
+function cli_build(bin: string, file: string, relaxed: boolean): void {
   const c     = fs.readFileSync(file, "utf8");
   const mac   = process.platform === "darwin";
   const cuda  = process.env.CUDA_HOME || "/usr/local/cuda";
@@ -432,7 +437,8 @@ function cli_build(bin: string, file: string): void {
     !mac && c.includes("#include <" + h + "/") ? ["-l" + l] : []);
   const cpu = [...objc, "-std=c11", "-O3", file, "-lpthread", "-lm",
     ...libs, "-o", path.resolve(bin)];
-  const gpu = mac ? ["-DBEND_METAL=1", ...cpu]
+  const gpu = mac
+    ? ["-DBEND_METAL=1", ...relaxed ? ["-DBEND_RELAXED=1"] : [], ...cpu]
     : ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
       "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
   const steps: [string, string[]][] = bangs

@@ -5062,7 +5062,11 @@ static bool gpu_probe(void) {
 static MTLComputePipelineDescriptor* gpu_desc(void) {
   NSError* err = nil;
   MTLCompileOptions* opts = [MTLCompileOptions new];
+#ifdef BEND_RELAXED
+  opts.mathMode = MTLMathModeRelaxed;
+#else
   opts.mathMode = MTLMathModeSafe;
+#endif
   opts.preprocessorMacros = @{ @"CUBE_LOG": @(CUBE_LOG) };
   id<MTLLibrary> lib = [gpu_dev newLibraryWithSource:@(BEND_SRC) options:opts
     error:&err];
