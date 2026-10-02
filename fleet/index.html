@@ -42,12 +42,11 @@
     browser's cache. Every loop of a shader counts its turns, so no dispatch can hold the GPU.
   </p>
   <p class="dim">
-    The rows named profiled say where a frame's time goes: sending, the GPU's rounds, reading back. With
-    <code>ts</code> they time each kernel on the GPU, which slows them: that fps is not the program's. The
-    last six run the same programs with their run in one kernel where the rows above split it in several
-    (on a Mac both are one kernel). One kernel runs faster and compiles slower, and on some drivers its
-    compile ends the browser's GPU process: the rows after it then run on the cores, and WebGPU comes back
-    when the browser restarts. That too is a result worth the report.
+    Off a Mac a large program runs split in several kernels, which compile sooner, and on Linux it moves to
+    its run as one kernel once that has compiled: the compile column gives both times, and a row with
+    <code>one=0</code> stays split. The rows named profiled say where a frame's time goes: sending, the
+    GPU's rounds, reading back. With <code>ts</code> they time each kernel on the GPU, which slows them:
+    that fps is not the program's.
   </p>
   <p><button id="go">Run all</button> <button id="copy" disabled>Copy the report</button> <span id="now" class="dim"></span></p>
   <p id="dev" class="dim"></p>
@@ -110,7 +109,7 @@ function brief(ps, rounds) {
   return { bangs: ps.length, period: ps.length > 1 ? Math.round((ps[ps.length - 1].at - ps[0].at) / (ps.length - 1) * 100) / 100 : null,
     prep: avg((p) => p.prep), wall: avg((p) => p.wall), wait: avg((p) => p.wait), span: avg((p) => p.span),
     submits: avg((p) => p.subs), rounds: avg((p) => p.rounds), sentKB: avg((p) => p.up / 1024), clearedKB: avg((p) => p.clr / 1024),
-    reads: avg((p) => p.rn), readKB: avg((p) => p.rd / 1024), readMs: avg((p) => p.rms), bands: avg((p) => p.wn), bandMs: avg((p) => p.wms),
+    reads: avg((p) => p.rn), hits: avg((p) => p.hit), readKB: avg((p) => p.rd / 1024), readMs: avg((p) => p.rms), bands: avg((p) => p.wn), bandMs: avg((p) => p.wms),
     kernels: arr("k"), roundMs: rounds ? arr("r") : undefined };
 }
 
@@ -142,10 +141,12 @@ async function run(t) {
   const M = () => f.contentWindow && f.contentWindow.Module;
   const hidden = () => document.visibilityState !== "visible";
   try {
-    const on = await until(() => M() && M().bendOn && !/while its shader/.test(M().bendOn) && M().bendOn, 960000);
+    const on = await until(() => M() && M().bendOn && !/while its shader|one kernel compiling/.test(M().bendOn)
+      && M().bendOn, 960000);
     r.on = on || "no status in 16 minutes";
     r.gpu = /^the ! on (?!the cores)/.test(r.on);
     r.compile = Number((/compiled in ([\d.]+) s/.exec(r.on) || [])[1]);
+    r.one = Number((/one kernel after ([\d.]+) s/.exec(r.on) || [])[1]);
     const stat = () => (M().bendGpu ? M().bendGpu.stat.slice() : [0, 0, 0]);
     if (t.secs) {
       await sleep(2000);
@@ -165,7 +166,7 @@ async function run(t) {
       if (ps.length > 0) {
         const b = r.prof = brief(ps, true);
         r.note += "a frame " + b.period + " ms: prep " + b.prep + ", ! " + b.wall + ", reads " + b.readMs + " ("
-          + Math.round(b.readKB) + " KB), bands " + b.bandMs + "; " + Math.round(b.sentKB) + " KB sent"
+          + Math.round(b.readKB) + " KB, " + b.hits + " with the header), bands " + b.bandMs + "; " + Math.round(b.sentKB) + " KB sent"
           + (b.span ? "; GPU " + b.span + ", by kernel " + b.kernels.join(" ") : "");
       }
     } else {
@@ -203,7 +204,7 @@ const num = (x, d) => (Number.isFinite(x) ? x.toFixed(d) : "");
 function show(tr, t, r) {
   const cells = r ? [`<span class="${r.ok ? "ok" : "bad"}">${r.ok ? "ok" : "FAIL"}</span>`,
     (r.on || "").replace(/^the ! on /, "").replace(/, compiled in .*/, "").slice(0, 44),
-    num(r.compile, 1) && num(r.compile, 1) + " s", num(r.fps, 1), num(r.ms, 2), num(r.rounds, 1),
+    num(r.compile, 1) && num(r.compile, 1) + " s" + (num(r.one, 1) && ", one kernel " + num(r.one, 1) + " s"), num(r.fps, 1), num(r.ms, 2), num(r.rounds, 1),
     (r.hidden ? "tab hidden. " : "") + (r.note || "").slice(-200)] : ["", "", "", "", "", "", ""];
   tr.innerHTML = `<td>${t.title}${t.q ? " <span class=dim>" + t.q + "</span>" : ""}</td>`
     + cells.map((c, i) => `<td class="${i >= 2 && i <= 5 ? "num" : i === 6 ? "note" : ""}">${c}</td>`).join("");
