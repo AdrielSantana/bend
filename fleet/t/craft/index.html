@@ -89,6 +89,6 @@ The selector under the picture runs the <code>!</code> on your GPU through WebGP
 </script>
 <script src="../coi-serviceworker.js"></script>
 <script>
-  document.write('<script src="index' + (true && /Windows/.test(
+  document.write('<script src="index' + (true && !/Mac OS X/.test(
     navigator.userAgent) ? ".d3d" : "") + '.js"><\/script>');
 </script>

@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Parallel sum</title>
+<title>Bendcraft, one kernel</title>
 <style>
   body { margin: 16px; background: #111; color: #ccc; display: flex;
     flex-direction: column; align-items: center; gap: 12px;
@@ -10,9 +10,9 @@
   select { font: inherit; color: inherit; background: #222; border: 1px solid #444; }
 </style>
 <canvas id="bend"></canvas>
-<pre><select id="bend-on"></select> <span id="bend-rate"></span></pre>
+<pre><select id="bend-on"></select> <select id="bend-size"></select> <select id="bend-scale"></select> <span id="bend-rate"></span></pre>
 <pre id="bend-out"></pre>
-<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Parallel sum</b>: one of the <a href="../../">fleet</a>'s programs.<br>
+<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Bendcraft, one kernel</b>: one of the <a href="../../">fleet</a>'s programs.<br>
 The selector under the picture runs the <code>!</code> on your GPU through WebGPU, or on a count of your CPU's threads.
 <a href="#" onclick="document.getElementById('bend').requestFullscreen(); return false">Fullscreen</a></p>
 <style>a { color: #8cf; }</style>
@@ -42,7 +42,7 @@ The selector under the picture runs the <code>!</code> on your GPU through WebGP
   };
   var Module = {
     arguments: ["--threads", String(threads)].concat(query.get("gpu")
-      ? ["--gpu", query.get("gpu")] : []),
+      ? ["--gpu", query.get("gpu")] : []).concat((query.get("size") || "").split("x").filter(Boolean)),
     print: say,
     printErr: say,
     onExit: function(code) {
@@ -65,8 +65,29 @@ The selector under the picture runs the <code>!</code> on your GPU through WebGP
   };
   setInterval(rate, 1000);
 </script>
+<script>
+  // The window's size and the render's scale (S times fewer rays a side, a power of two), a reload each.
+  (function() {
+    var now = (query.get("size") || "512x512x1").split("x");
+    var fill = function(id, vs, v, name) {
+      var el = document.getElementById(id);
+      vs.concat([v]).forEach(function(x) {
+        if (![].some.call(el.options, function(o) { return o.value === x; })) {
+          el.appendChild(new Option(name(x), x));
+        }
+      });
+      el.value = v;
+      el.onchange = function() {
+        query.set("size", document.getElementById("bend-size").value + "x" + document.getElementById("bend-scale").value);
+        location.search = query;
+      };
+    };
+    fill("bend-size", ["512x512", "960x540", "1280x720", "1470x796", "1920x1080", screen.width + "x" + screen.height],
+      now[0] + "x" + now[1], function(x) { return x.replace("x", "\u00d7"); });
+    fill("bend-scale", ["1", "2", "4"], now[2] || "1", function(x) { return "scale " + x; });
+  })();
+</script>
 <script src="../coi-serviceworker.js"></script>
 <script>
-  document.write('<script src="index' + (true && !/Mac OS X/.test(
-    navigator.userAgent) ? ".d3d" : "") + '.js"><\/script>');
+  document.write('<script src="index' + (true && (!/Mac OS X/.test(navigator.userAgent) || /d3d/.test(location.search)) && !/whole/.test(location.search) ? ".d3d" : "") + '.js"><\/script>');
 </script>

@@ -41,6 +41,12 @@
     every shader, which on Windows takes a minute or two a program; a second run reads them from the
     browser's cache. Every loop of a shader counts its turns, so no dispatch can hold the GPU.
   </p>
+  <p class="dim">
+    The last three rows run the same programs with their run in one kernel where the rows above split it
+    in several (on a Mac both are one kernel). One kernel runs faster and compiles slower, and on some
+    drivers its compile ends the browser's GPU process: the rows after it then run on the cores, and
+    WebGPU comes back when the browser restarts. That too is a result worth the report.
+  </p>
   <p><button id="go">Run all</button> <button id="copy" disabled>Copy the report</button> <span id="now" class="dim"></span></p>
   <p id="dev" class="dim"></p>
   <div class="wide">
@@ -172,7 +178,7 @@ function show(tr, t, r) {
   const cells = r ? [`<span class="${r.ok ? "ok" : "bad"}">${r.ok ? "ok" : "FAIL"}</span>`,
     (r.on || "").replace(/^the ! on /, "").replace(/, compiled in .*/, "").slice(0, 44),
     num(r.compile, 1) && num(r.compile, 1) + " s", num(r.fps, 1), num(r.ms, 2), num(r.rounds, 1),
-    (r.hidden ? "tab hidden. " : "") + (r.note || "")] : ["", "", "", "", "", "", ""];
+    (r.hidden ? "tab hidden. " : "") + (r.note || "").slice(-200)] : ["", "", "", "", "", "", ""];
   tr.innerHTML = `<td>${t.title}${t.q ? " <span class=dim>" + t.q + "</span>" : ""}</td>`
     + cells.map((c, i) => `<td class="${i >= 2 && i <= 5 ? "num" : i === 6 ? "note" : ""}">${c}</td>`).join("");
 }

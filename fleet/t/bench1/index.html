@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Parallel sum</title>
+<title>Bendcraft's bench, one kernel</title>
 <style>
   body { margin: 16px; background: #111; color: #ccc; display: flex;
     flex-direction: column; align-items: center; gap: 12px;
@@ -12,7 +12,7 @@
 <canvas id="bend"></canvas>
 <pre><select id="bend-on"></select> <span id="bend-rate"></span></pre>
 <pre id="bend-out"></pre>
-<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Parallel sum</b>: one of the <a href="../../">fleet</a>'s programs.<br>
+<p style="max-width: 640px"><a href="../">&larr; all demos</a> · <b>Bendcraft's bench, one kernel</b>: one of the <a href="../../">fleet</a>'s programs.<br>
 The selector under the picture runs the <code>!</code> on your GPU through WebGPU, or on a count of your CPU's threads.
 <a href="#" onclick="document.getElementById('bend').requestFullscreen(); return false">Fullscreen</a></p>
 <style>a { color: #8cf; }</style>
@@ -67,6 +67,5 @@ The selector under the picture runs the <code>!</code> on your GPU through WebGP
 </script>
 <script src="../coi-serviceworker.js"></script>
 <script>
-  document.write('<script src="index' + (true && !/Mac OS X/.test(
-    navigator.userAgent) ? ".d3d" : "") + '.js"><\/script>');
+  document.write('<script src="index' + (true && (!/Mac OS X/.test(navigator.userAgent) || /d3d/.test(location.search)) && !/whole/.test(location.search) ? ".d3d" : "") + '.js"><\/script>');
 </script>
