@@ -42,10 +42,12 @@
     browser's cache. Every loop of a shader counts its turns, so no dispatch can hold the GPU.
   </p>
   <p class="dim">
-    The last three rows run the same programs with their run in one kernel where the rows above split it
-    in several (on a Mac both are one kernel). One kernel runs faster and compiles slower, and on some
-    drivers its compile ends the browser's GPU process: the rows after it then run on the cores, and
-    WebGPU comes back when the browser restarts. That too is a result worth the report.
+    The rows named profiled say where a frame's time goes: sending, the GPU's rounds, reading back. With
+    <code>ts</code> they time each kernel on the GPU, which slows them: that fps is not the program's. The
+    last six run the same programs with their run in one kernel where the rows above split it in several
+    (on a Mac both are one kernel). One kernel runs faster and compiles slower, and on some drivers its
+    compile ends the browser's GPU process: the rows after it then run on the cores, and WebGPU comes back
+    when the browser restarts. That too is a result worth the report.
   </p>
   <p><button id="go">Run all</button> <button id="copy" disabled>Copy the report</button> <span id="now" class="dim"></span></p>
   <p id="dev" class="dim"></p>
@@ -98,6 +100,20 @@ async function adapter() {
     maxComputeInvocationsPerWorkgroup: ad.limits.maxComputeInvocationsPerWorkgroup };
 }
 
+// A profiled page's bangs (G.prof) as one: the ms from a bang to the next, queueing its uploads (prep), in its
+// rounds (wall), waiting on their submits, and reading back after it (the results, the window's bands); the
+// bytes sent, cleared and read; with ?ts the GPU's ms from its first pass to its last (span) and a kernel (plan,
+// the run's, pack). A bench reports each bang, a game their mean with the GPU's ms a round.
+function brief(ps, rounds) {
+  const avg = (f) => Math.round(ps.reduce((a, p) => a + f(p), 0) / ps.length * 100) / 100;
+  const arr = (k) => Array.from({ length: Math.max(...ps.map((p) => p[k].length)) }, (_, i) => avg((p) => p[k][i] || 0));
+  return { bangs: ps.length, period: ps.length > 1 ? Math.round((ps[ps.length - 1].at - ps[0].at) / (ps.length - 1) * 100) / 100 : null,
+    prep: avg((p) => p.prep), wall: avg((p) => p.wall), wait: avg((p) => p.wait), span: avg((p) => p.span),
+    submits: avg((p) => p.subs), rounds: avg((p) => p.rounds), sentKB: avg((p) => p.up / 1024), clearedKB: avg((p) => p.clr / 1024),
+    reads: avg((p) => p.rn), readKB: avg((p) => p.rd / 1024), readMs: avg((p) => p.rms), bands: avg((p) => p.wn), bandMs: avg((p) => p.wms),
+    kernels: arr("k"), roundMs: rounds ? arr("r") : undefined };
+}
+
 // A frame's output, without the exit line.
 const text = (f) => (f.contentDocument.getElementById("bend-out").textContent || "")
   .replace(/(^|\n)exit \d+\n?$/, "").trim();
@@ -145,6 +161,13 @@ async function run(t) {
       const err = /^bend: .*/m.exec(text(f));
       r.ok = r.fps > 0 && !err;
       r.note = err ? err[0] : "";
+      const ps = (t.prof && M().bendGpu && M().bendGpu.prof || []).slice(5);
+      if (ps.length > 0) {
+        const b = r.prof = brief(ps, true);
+        r.note += "a frame " + b.period + " ms: prep " + b.prep + ", ! " + b.wall + ", reads " + b.readMs + " ("
+          + Math.round(b.readKB) + " KB), bands " + b.bandMs + "; " + Math.round(b.sentKB) + " KB sent"
+          + (b.span ? "; GPU " + b.span + ", by kernel " + b.kernels.join(" ") : "");
+      }
     } else {
       const done = await until(() => /(^|\n)(exit \d+|bend: .*)\n?$/.test(
         f.contentDocument.getElementById("bend-out").textContent), t.wait || 120000);
@@ -153,6 +176,9 @@ async function run(t) {
       r.rounds = s[1] / s[0];
       r.ms = s[2] / s[0];
       r.ran = M().bendRan;
+      if (t.prof && M().bendGpu.prof) {
+        r.prof = M().bendGpu.prof.map((p) => brief([p], false));
+      }
       Object.assign(r, done ? judge(t, out) : { ok: false, note: "no end in " + (t.wait || 120000) / 1000 + " s" });
       if (t.turns && r.bangs > 0) {
         r.note = (r.ms * 1e6 / t.turns).toFixed(3) + " ns a lane's turn; " + (r.note || "");
