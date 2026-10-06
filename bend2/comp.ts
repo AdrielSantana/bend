@@ -4214,6 +4214,7 @@ INLINE Term blk_new(Env e, bool arr, u64 d, u32 lgs, u32 n, THR Term* v) {
 #define ring_slot(H, r, p) ring_word(H, r, (p) & (RING_LEN - 1))
 #define ring_get(H, r)     ((DEV u32*)ring_word(H, r, RING_LEN))
 #define ring_put(H, r)     ((DEV u32*)ring_word(H, r, RING_LEN + 1))
+#define ring_held(H, r)    (ring_put(H, r) + 1)
 
 INLINE u32 ring_lap(u32 pos) {
   return ~(u32)(pos / RING_LEN) & 1;
@@ -4493,15 +4494,13 @@ INLINE u32 monk_step(Env e, DEV Term* stk, u32 rg, u32 put0, u32 base, u32 strid
 // Dev
 // ===
 
-// One kernel: pass 0 grows the frontier, pass 1 drains each lane's ring,
-// pass 2 packs the banks: in one group, each bank's [top, wr) slides onto
+// One kernel: pass 0 grows the frontier, pass 1 runs the c-th deal on lane
+// c, pass 2 packs the banks: in one group, each bank's [top, wr) slides onto
 // rd, CUBE_T entries a step (loads, barrier, stores: rd <= top), off the
 // host's pages. A grow pass ends when its group is full or nothing grew,
 // so a spine of forks unrolls whole. TG_HOLD words of threadgroup memory
-// hold one group per Apple core (bitonic 1.35x without). Pass 3, the
-// work after a grow, drains the lane's own ring, not the deals' flip, to
-// the put the grow left: a SIMD group runs neighbours, and a late group
-// leaves this pass's deals to the next round.
+// hold one group per Apple core (bitonic 1.35x without). Pass 3 is pass 1
+// after a grow from under CUBE_T roots, on the lane's own ring to ring_held.
 
 #if DEVICE
 
@@ -4572,7 +4571,7 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
     }
   }
   BAR();
-  u32 put0      = a32_load(ring_put(H, rg) + (pass == 3));
+  u32 put0      = a32_load(pass == 3 ? ring_held(H, rg) : ring_put(H, rg));
   u32 seen_has  = 0;
   u32 seen_grew = 0;
   for (;;) {
@@ -4608,7 +4607,9 @@ extern "C" __global__ void bend_dev(DEV u64* H, u32 pass) {
       seen_grew = grew;
     }
   }
-  a32_store(ring_put(H, rg) + 1, a32_load(ring_put(H, rg)));
+  if (pass == 0) {
+    a32_store(ring_held(H, rg), a32_load(ring_put(H, rg)));
+  }
   dev_cut(e);
 }
 
@@ -4863,7 +4864,7 @@ static void gpu_run(u32 f) {
   if (f < LANES) {
     gpu_kernel(0, CUBE_G);
   }
-  gpu_kernel(f < LANES ? 3 : 1, CUBE_G);
+  gpu_kernel(f < CUBE_T ? 3 : 1, CUBE_G);
   gpu_kernel(2, 1);
 }
 
